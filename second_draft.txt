@@ -1,0 +1,2511 @@
+################################################### Module Information ##################################################
+#  Module Name         : Geo level sales summary                                                                        #
+#  Purpose             : This dataset will contain the geo level sales summary information                              #
+#  Source Tables       : A1: cfg_gner_parm_val, cfg_trlst_parm_tbl, r_aligt_mkt_epa_uvrs, d_time_bckt, d_aligt_geo,     #
+#                         r_geo_funcl_hiery, d_prod, f_mat_sls_xpopd_geo, f_mat_sls_xpopd_geo_dtl, f_mat_trlst_geo,     #
+#                         f_mat_claim_pat_geo, f_mat_sls_ddd_geo, f_mat_sls_ddd_geo_dtl, f_mat_bio_sls_spsd_geo,        #
+#                         f_mat_acty_call_geo, f_mat_acty_dcsn_geo                                                      #
+#  Target Table        : f_mat_geo_smry, f_mat_geo_seg_smry                                                             #
+#  Last changed on     : 18-07-2025                                                                                     #
+#  Last changed by     : Moksha Upadhyaya                                                                               #
+#  Reason for change   : Incorporation of segmentation grain                                                            #
+#  Return Values       : NA                                                                                             #
+#########################################################################################################################
+################################################ High level Process #####################################################################################################################################################
+#   Step 1: Create a Global Config Dataframe                                                                                                                                                                            #
+#   Step 2: Dataframe for Child to Parent Hiery Mapping with excluded teams                                                                                                                                             #
+#   Step 3: Dataframe for Child to Parent Hiery Mapping with included teams                                                                                                                                             #
+#   Step 4: Global Time Bucket Dataframe                                                                                                                                                                                #
+#   Step 5: Trialist Cnfgs Dataframe                                                                                                                                                                                    #
+#   Step 6: Global Dataframe for Team-Market-Brand Mapping                                                                                                                                                              #
+#   Step 7: Global Team-Hiery Alignment Dataframe                                                                                                                                                                       #
+#   Step 8: Fetch XPO data from fact: Fetch tb from time dimension and restrict time-bucket, team, market ,seg type and  channel through configs																		#	
+#   Step 9: Fetch XPO DTL data from fact: Fetch tb from time dimension and restrict time-bucket, team, market ,seg type and  bridge flag through configs                                                                #
+#   Step 10: Merge the above XPO Dataframes                                                                                                                                                                             #
+#   Step 11: Fetch Trialist data from fact: Fetch tb from time dimension and restrict time-bucket, team, market ,seg type, channel, src_typ, lvl_view_ds through configs                                                #
+#   Step 12: Fetch Claims data from fact: Fetch tb from time dimension and restrict time-bucket, team, market ,seg type through configs                                                                                 #
+#   Step 13: Fetch DDD data from fact: Fetch tb from time dimension and restrict time-bucket, team, market ,seg type and  channel through configs                                                                       #
+#   Step 14: Fetch DDD DTL data from fact: Fetch tb from time dimension and restrict time-bucket, team, market ,seg type and  channel through configs                                                                   #
+#   Step 15: Merge the above DDD Dataframes                                                                                                                                                                             #
+#   Step 16: Fetch SPSD data from fact: Fetch tb from time dimension and restrict time-bucket, team, market ,seg type and  channel through configs                                                                      #
+#   Step 17: Fetch Execution Discussion data from fact: Fetch tb from time dimension and restrict time-bucket, team, market ,seg type and  cust clas through configs                                                    #
+#   Step 18: Fetch Execution Call data from fact: Fetch tb from time dimension and restrict team, cust clas ,non_pscbr_atnde_flg through configs                                                                        #
+#   Step 19: Merge Final Dataframes of above Data Sources                                                                                                                                                               #
+#   Step 20: Deduping the above fetched records                                                                                                                                                                         #
+#   Step 21: Populate Parent grains by self joining the above Dataframe                                                                                                                                                 #
+#   Step 22: Populate National level metrics by self joining above Dataframe and filtering on hiery level to be Nation                                                                                                  #
+#   Step 23: Final Type Cast and write data on Datalake Layer                                                                                                                                                           #
+#   Step 24: Write data on Publish Layer                                                                                                                                                                                #
+#########################################################################################################################################################################################################################
+from pyspark import StorageLevel
+import datetime
+import re
+batch = "".join(re.findall(r'\d+', str(datetime.datetime.now())))
+data_dt =batch[:8]
+cycl_id = data_dt.ljust(19,'0')
+def run(*args,spark,to_table_name,to_spark_table_name,from_l2_publish_schema_name,to_datalake_schema_name,to_publish_schema_name,from_publish_schema_name,from_datalake_schema_name,from_staging_publish_schema_name,**kwargs):
+## setting up spark properties
+spark.sql("""SET hive.exec.dynamic.partition = true""")
+spark.conf.set("spark.sql.legacy.allowCreatingManagedTableUsingNonemptyLocation","true") 
+spark.sql("set spark.sql.sources.commitProtocolClass=com.databricks.io.CommitProtocol")
+spark.sql(""" set hive.exec.dynamic.partition.mode=nonstrict """)
+spark.sql("""set spark.sql.broadcastTimeout = 30000""")
+spark.conf.set("spark.sql.shuffle.partitions","auto")
+# Step 1: Global Cnfgs Dataframe
+cfg_gner_parm_val_df  = spark.sql(f"""
+select 
+tbl_nm,
+parm_type,
+val,
+attr1,
+attr2,
+attr3
+from
+{from_publish_schema_name}.cfg_gner_parm_val
+where 
+tbl_nm in ('f_mat_geo_smry')
+group by 
+tbl_nm,
+parm_type,
+val,
+attr1,
+attr2,
+attr3
+""")  
+cfg_gner_parm_val_df.createOrReplaceTempView("cfg_gner_parm_val_df")
+cfg_gner_parm_val_df.persist(StorageLevel.MEMORY_AND_DISK_2)
+r_geo_funcl_hiery_excl_temp_df = spark.sql(f"""
+select
+hiery.chld_hiery_id, 
+hiery.chld_hiery_ds,
+hiery.chld_hiery_lvl,
+hiery.par_hiery_id, 
+hiery.par_hiery_ds, 
+hiery.par_hiery_lvl
+from
+{from_publish_schema_name}.r_geo_funcl_hiery hiery
+join
+{from_publish_schema_name}.d_aligt_geo algt
+on 
+hiery.chld_hiery_id= algt.geo_id
+left join
+cfg_gner_parm_val_df cfg
+on
+cfg.tbl_nm = lower('f_mat_geo_smry')
+and cfg.parm_type = 'hiery_lvl_exclude'
+and algt.team_nm = cfg.val  
+and UPPER(concat(hiery.chld_hiery_lvl,'-', hiery.par_hiery_lvl)) = UPPER(cfg.attr1)
+where
+concat(hiery.chld_hiery_lvl,'-', hiery.par_hiery_lvl) in ('TERR-DIST','DIST-REG','REG-AREA','AREA-NAT') 
+and cfg.val is null 
+and hiery.hiery_type='GEO'
+group by
+hiery.chld_hiery_id, 
+hiery.chld_hiery_ds,
+hiery.chld_hiery_lvl,
+hiery.par_hiery_id, 
+hiery.par_hiery_ds, 
+hiery.par_hiery_lvl
+""")
+r_geo_funcl_hiery_excl_temp_df.createOrReplaceTempView("r_geo_funcl_hiery_excl_temp_df")
+r_geo_funcl_hiery_incl_temp_df = spark.sql(f"""
+select
+hiery.chld_hiery_id, 
+hiery.chld_hiery_ds,
+hiery.chld_hiery_lvl,
+hiery.par_hiery_id, 
+hiery.par_hiery_ds, 
+hiery.par_hiery_lvl
+from
+{from_publish_schema_name}.r_geo_funcl_hiery hiery
+join
+{from_publish_schema_name}.d_aligt_geo algt
+on 
+hiery.chld_hiery_id= algt.geo_id
+and hiery.hiery_type='GEO'
+join
+cfg_gner_parm_val_df cfg
+on
+cfg.tbl_nm = lower('f_mat_geo_smry')
+and cfg.parm_type = 'hiery_lvl_include'
+and algt.team_nm = cfg.val  
+and UPPER(concat(hiery.chld_hiery_lvl,'-', hiery.par_hiery_lvl)) = UPPER(cfg.attr1)
+group by
+hiery.chld_hiery_id, 
+hiery.chld_hiery_ds,
+hiery.chld_hiery_lvl,
+hiery.par_hiery_id, 
+hiery.par_hiery_ds, 
+hiery.par_hiery_lvl
+""")
+r_geo_funcl_hiery_incl_temp_df.createOrReplaceTempView("r_geo_funcl_hiery_incl_temp_df")
+r_geo_funcl_hiery_temp_df = r_geo_funcl_hiery_excl_temp_df.unionAll(r_geo_funcl_hiery_incl_temp_df)
+r_geo_funcl_hiery_temp_df.createOrReplaceTempView("r_geo_funcl_hiery_temp_df")    
+# Step 4: Global Time Bucket Dataframe (for all sales sources)
+cfg_tb_mkt_rstrct_df  = spark.sql(f"""
+select 
+tb.src_nm,
+tb.tb_id,
+tb.tb_cd,
+cfg.attr1 as mkt_nm
+from
+{from_publish_schema_name}.d_time_bckt tb
+join 
+cfg_gner_parm_val_df cfg
+on
+UPPER(tb.src_nm) = UPPER(trim(cfg.attr2))
+and lower(trim(cfg.tbl_nm)) = 'f_mat_geo_smry'
+and lower(trim(cfg.parm_type)) = 'src_tb_rstrct'
+and upper(trim(cfg.val)) = upper(tb.tb_cd)
+where 
+upper(appl_nm) in('MAT') and upper(tb_type) in('CURR') 
+group by 
+tb.src_nm,
+tb.tb_id,
+tb.tb_cd,
+cfg.attr1,
+cfg.attr2
+""")
+cfg_tb_mkt_rstrct_df.createOrReplaceTempView("cfg_tb_mkt_rstrct_df")
+cfg_tb_mkt_rstrct_df.persist(StorageLevel.MEMORY_AND_DISK_2)
+cfg_tb_mkt_exec_rstrct_df  = spark.sql(f"""
+select 
+tb.src_nm,
+tb.tb_id,
+tb.tb_cd as src_tb_cd,
+cfg.attr1 as nw_tb_cd,
+cfg.attr2 as mkt_nm
+from
+{from_publish_schema_name}.d_time_bckt tb
+join 
+cfg_gner_parm_val_df cfg
+on
+UPPER(tb.src_nm) = UPPER(trim(cfg.attr3))
+and lower(trim(cfg.tbl_nm)) = 'f_mat_geo_smry'
+and lower(trim(cfg.parm_type)) = 'src_tb_rstrct_exec'
+and upper(trim(cfg.val)) = upper(tb.tb_cd)
+where 
+upper(appl_nm) in('MAT') and upper(tb_type) in('CURR') 
+group by 
+tb.src_nm,
+tb.tb_id,
+tb.tb_cd,
+cfg.attr1,
+cfg.attr2,
+cfg.attr3
+""")
+cfg_tb_mkt_exec_rstrct_df.createOrReplaceTempView("cfg_tb_mkt_exec_rstrct_df")
+cfg_tb_mkt_exec_rstrct_df.persist(StorageLevel.MEMORY_AND_DISK_2)    
+cfg_trlst_parm_tbl_df  = spark.sql(f"""
+select 
+tbl_nm,
+parm_type,
+val,
+attr1,
+attr2,
+attr3,
+attr4,
+attr5,
+attr6,
+attr7,
+attr8
+from
+{from_staging_publish_schema_name}.cfg_trlst_parm_tbl
+where 
+tbl_nm in ('f_mat_geo_smry')
+group by 
+tbl_nm,
+parm_type,
+val,
+attr1,
+attr2,
+attr3,
+attr4,
+attr5,
+attr6,
+attr7,
+attr8
+""")   
+cfg_trlst_parm_tbl_df.createOrReplaceTempView("cfg_trlst_parm_tbl_df")
+cfg_trlst_parm_tbl_df.persist(StorageLevel.MEMORY_AND_DISK_2)
+# Step 6: Global Dataframe for Team-Market-Brand Mapping
+tm_mkt_prd_df  = spark.sql(f"""
+select 
+epa.team_id,
+epa.team_nm,
+epa.az_mkt_id,
+epa.mkt_nm,
+epa.geo_id,
+epa.geo_ds,
+epa.brd_fam_id,
+prd.brd_fam_ds
+from 
+{from_publish_schema_name}.r_aligt_mkt_epa_uvrs epa 
+join
+{from_publish_schema_name}.d_prod prd
+on 
+epa.brd_fam_id = prd.brd_fam_id 
+group by
+epa.team_id,
+epa.team_nm,
+epa.az_mkt_id,
+epa.mkt_nm,
+epa.geo_id,
+epa.geo_ds, 
+epa.brd_fam_id,
+prd.brd_fam_ds 
+""")
+tm_mkt_prd_df.createOrReplaceTempView('tm_mkt_prd_df')
+tm_mkt_prd_df.persist(StorageLevel.MEMORY_AND_DISK_2)
+# Step 7: Global Team-Hiery Alignment Dataframe
+d_aligt_df  = spark.sql(f"""
+select 
+team_id,
+team_nm
+from 
+{from_publish_schema_name}.d_aligt_geo
+group by
+team_id,
+team_nm
+""")
+d_aligt_df.createOrReplaceTempView('d_aligt_df')
+d_aligt_df.persist(StorageLevel.MEMORY_AND_DISK_2)
+temp_xpopd_sls_final_df = spark.sql(f"""
+select 
+/*+ broadcast(algt,tb,cfg) */
+sls.tb_id,
+tb.tb_cd,
+sls.geo_id,
+sls.geo_ds,
+algt.team_id,
+algt.team_nm,
+sls.az_mkt_id,
+sls.mkt_nm,
+sls.brd_fam_id,
+sls.brd_fam_ds,
+upper(seg.seg_type) as seg_type,
+sls.seg_val_id,
+sls.cur_trx_ct,
+sls.prev_trx_ct,
+sls.cur_mkt_trx_ct,
+sls.prev_mkt_trx_ct,
+sls.cur_nrx_ct,
+sls.prev_nrx_ct,
+sls.cur_mkt_nrx_ct,
+sls.prev_mkt_nrx_ct,
+sls.cur_nbrx_ct,
+sls.prev_nbrx_ct,
+sls.cur_mkt_nbrx_ct,
+sls.prev_mkt_nbrx_ct,
+NULL as cur_uvrs_ct,
+NULL as cur_trlst_ct,
+NULL as prev_trlst_ct,
+NULL as cur_rptr_ct,
+NULL as prev_rptr_ct,
+NULL as cur_adpt_ct,
+NULL as prev_adptr_ct,
+NULL as totl_adpt_dpth,
+NULL as bob_adpt_dpth,
+NULL as trgt_adpt_dpth,
+NULL as cur_tot_wrtr,
+NULL as prev_tot_wrtr,
+NULL as cur_dmnd_unit,
+NULL as prev_dmnd_unit,
+NULL as cur_mkt_dmnd_unit,
+NULL as prev_mkt_dmnd_unit,
+NULL as cur_ddd_unit,
+NULL as prev_ddd_unit,
+NULL as cur_mkt_ddd_unit,
+NULL as prev_mkt_ddd_unit,
+NULL as cur_sp_unit,
+NULL as prev_sp_unit,
+NULL as cur_sd_unit,
+NULL as prev_sd_unit,
+NULL as cur_unit,
+NULL as prev_unit,
+NULL as cur_sd_vial,
+NULL as prev_sd_vial,
+NULL as cur_wrtr_sd_ct,
+NULL as prev_wrtr_sd_ct,
+NULL as cur_actv_shp_pat_ct,
+NULL as cur_actv_all_pat_ct,
+NULL as cur_new_pat_ct,
+NULL as prev_new_pat_ct,
+NULL as cur_net_ref_ct,
+NULL as prev_net_ref_ct,
+NULL as cur_rch_pct,
+NULL as cur_rch_high_pct,
+NULL as cur_totl_cpd_ct,
+NULL as cur_trgt_cpd_ct,
+NULL as cur_tdfa_pct,
+NULL as cur_tdfa_high_pct,
+NULL as dscn_ach,
+NULL as trgt_dscn_ach,
+NULL as dscn_asgn,
+NULL as p1_dscn_ach,
+NULL as p2_dscn_ach,
+NULL as p1_dscn_asgn,
+NULL as p2_dscn_asgn,
+sls.load_dt as src_load_dt
+from 
+{from_publish_schema_name}.f_mat_sls_xpopd_geo sls
+join
+{from_publish_schema_name}.d_aligt_geo algt
+on
+sls.geo_id = algt.geo_id
+join
+cfg_tb_mkt_rstrct_df tb
+on 
+sls.tb_id = tb.tb_id
+and sls.mkt_nm = tb.mkt_nm
+join
+cfg_gner_parm_val_df cfg
+on
+lower(cfg.tbl_nm) = 'f_mat_geo_smry'
+and lower(cfg.parm_type) = 'xpopd_perf'
+and upper(cfg.val) = upper(sls.mkt_nm)
+and upper(cfg.attr1) = upper(algt.team_nm)
+and upper(cfg.attr2) = upper(sls.chnl_nm)
+join 
+{from_publish_schema_name}.d_seg seg
+on
+sls.seg_val_id=seg.seg_val_id
+""")
+temp_xpopd_sls_final_df.createOrReplaceTempView("temp_xpopd_sls_final_df")    
+temp_trlst_geo_adpt_dpth_sls_df = spark.sql(f"""
+select
+/*+ broadcast(cfg, tb) */
+trlst.tb_id,
+trlst.tb_cd,
+trlst.geo_id,
+trlst.geo_ds,
+trlst.team_id,
+trlst.team_nm,
+trlst.az_mkt_id,
+trlst.mkt_nm,
+trlst.brd_fam_id,
+trlst.brd_fam_ds,
+upper(seg.seg_type) as seg_type,
+trlst.seg_id,
+case when upper(trgt_view_ds) = 'ALL' then trlst.cur_adptr_ct / trlst.cur_uvrs_ct else 0 end as totl_adpt_dpth,
+case when upper(trgt_view_ds) = 'BOB' then trlst.cur_adptr_ct / trlst.cur_uvrs_ct else 0 end as bob_adpt_dpth,
+case when upper(trgt_view_ds) = upper(cfg.attr7) then trlst.cur_adptr_ct / trlst.cur_uvrs_ct else 0 end as trgt_adpt_dpth
+from 
+{from_publish_schema_name}.f_mat_trlst_geo trlst
+join
+cfg_trlst_parm_tbl_df cfg
+on
+lower(cfg.tbl_nm) = 'f_mat_geo_smry'
+and lower(cfg.parm_type) = 'trlst_perf'
+and upper(cfg.val) = upper(trlst.mkt_nm)
+and upper(cfg.attr1) = upper(trlst.team_nm)
+and upper(cfg.attr2) = upper(trlst.chnl_nm)
+and upper(cfg.attr4) = upper(trlst.src_typ) 
+and upper(cfg.attr5) = upper(trlst.lvl_view_ds)
+and upper(cfg.attr6) = upper(trlst.tb_cd)
+join 
+{from_publish_schema_name}.d_seg seg
+on
+trlst.seg_id=seg.seg_val_id
+""")
+temp_trlst_geo_adpt_dpth_sls_df.createOrReplaceTempView('temp_trlst_geo_adpt_dpth_sls_df')
+temp_trlst_geo_sls_df = spark.sql(f"""
+select
+/*+ broadcast(cfg, tb) */
+trlst.tb_id,
+trlst.tb_cd,
+trlst.geo_id,
+trlst.geo_ds,
+trlst.team_id,
+trlst.team_nm,
+trlst.az_mkt_id,
+trlst.mkt_nm,
+trlst.brd_fam_id,
+trlst.brd_fam_ds,
+upper(seg.seg_type) as seg_type,
+trlst.seg_id as seg_val_id,
+NULL as cur_trx_ct,
+NULL as prev_trx_ct,
+NULL as cur_mkt_trx_ct,
+NULL as prev_mkt_trx_ct,
+NULL as cur_nrx_ct,
+NULL as prev_nrx_ct,
+NULL as cur_mkt_nrx_ct,
+NULL as prev_mkt_nrx_ct,
+NULL as cur_nbrx_ct,
+NULL as prev_nbrx_ct,
+NULL as cur_mkt_nbrx_ct,
+NULL as prev_mkt_nbrx_ct,
+trlst.cur_uvrs_ct,
+trlst.cur_trlst_ct,
+trlst.prev_trlst_ct,
+trlst.cur_rptr_ct,
+trlst.prev_rptr_ct,
+trlst.cur_adptr_ct,
+trlst.prev_adptr_ct,
+COALESCE(dpth.totl_adpt_dpth, 0) as totl_adpt_dpth,
+COALESCE(dpth.bob_adpt_dpth, 0) as bob_adpt_dpth,
+COALESCE(dpth.trgt_adpt_dpth, 0) as trgt_adpt_dpth,
+trlst.cur_tot_wrtr,
+trlst.prev_tot_wrtr,
+NULL as cur_dmnd_unit,
+NULL as prev_dmnd_unit,
+NULL as cur_mkt_dmnd_unit,
+NULL as prev_mkt_dmnd_unit,
+NULL as cur_ddd_unit,
+NULL as prev_ddd_unit,
+NULL as cur_mkt_ddd_unit,
+NULL as prev_mkt_ddd_unit,
+NULL as cur_sp_unit,
+NULL as prev_sp_unit,
+NULL as cur_sd_unit,
+NULL as prev_sd_unit,
+NULL as cur_unit,
+NULL as prev_unit,
+NULL as cur_sd_vial,
+NULL as prev_sd_vial,
+NULL as cur_wrtr_sd_ct,
+NULL as prev_wrtr_sd_ct,
+NULL as cur_actv_shp_pat_ct,
+NULL as cur_actv_all_pat_ct,
+NULL as cur_new_pat_ct,
+NULL as prev_new_pat_ct,
+NULL as cur_net_ref_ct,
+NULL as prev_net_ref_ct,
+NULL as cur_rch_pct,
+NULL as cur_rch_high_pct,
+NULL as cur_totl_cpd_ct,
+NULL as cur_trgt_cpd_ct,
+NULL as cur_tdfa_pct,
+NULL as cur_tdfa_high_pct,
+NULL as dscn_ach,
+NULL as trgt_dscn_ach,
+NULL as dscn_asgn,
+NULL as p1_dscn_ach,
+NULL as p2_dscn_ach,
+NULL as p1_dscn_asgn,
+NULL as p2_dscn_asgn,
+trlst.src_load_dt as src_load_dt
+from 
+{from_publish_schema_name}.f_mat_trlst_geo trlst
+join
+cfg_trlst_parm_tbl_df cfg
+on
+lower(cfg.tbl_nm) = 'f_mat_geo_smry'
+and lower(cfg.parm_type) = 'trlst_perf'
+and upper(cfg.val) = upper(trlst.mkt_nm)
+and upper(cfg.attr1) = upper(trlst.team_nm)
+and upper(cfg.attr2) = upper(trlst.chnl_nm)
+and upper(cfg.attr4) = upper(trlst.src_typ) 
+and upper(cfg.attr5) = upper(trlst.lvl_view_ds)
+and upper(cfg.attr6) = upper(trlst.tb_cd)
+left join temp_trlst_geo_adpt_dpth_sls_df dpth
+on
+trlst.tb_id = dpth.tb_id
+and trlst.geo_id = dpth.geo_id
+and trlst.team_id = dpth.team_id
+and trlst.az_mkt_id = dpth.az_mkt_id
+and trlst.brd_fam_id = dpth.brd_fam_id
+and trlst.seg_id = dpth.seg_id
+left join
+cfg_trlst_parm_tbl_df cfg_rstrct
+on
+lower(cfg_rstrct.tbl_nm) = 'f_mat_geo_smry'
+and lower(cfg_rstrct.parm_type) = 'geo_smry_uvrs_rstrct'
+and upper(cfg_rstrct.attr3) = upper(trlst.mkt_nm)
+and upper(cfg_rstrct.val) = upper(trlst.trgt_view_ds)
+and upper(cfg_rstrct.attr1) = upper(trlst.brd_fam_ds)
+and upper(cfg_rstrct.attr2) = upper(trlst.team_nm)
+join 
+{from_publish_schema_name}.d_seg seg
+on
+trlst.seg_id=seg.seg_val_id
+where cfg_rstrct.val IS NULL
+""")
+temp_trlst_geo_sls_df.createOrReplaceTempView('temp_trlst_geo_sls_df')
+temp_claim_pat_sls_df = spark.sql(f"""
+select 
+/*+ broadcast(cfg, tb) */
+clm.tb_id,
+tb.tb_cd,
+clm.geo_id,
+clm.geo_ds,
+algt.team_id,
+algt.team_nm,
+clm.az_mkt_id,
+clm.mkt_nm,
+clm.brd_fam_id,
+clm.brd_fam_ds,
+upper(seg.seg_type) as seg_type,
+clm.seg_val_id,
+NULL as cur_trx_ct,
+NULL as prev_trx_ct,
+NULL as cur_mkt_trx_ct,
+NULL as prev_mkt_trx_ct,
+NULL as cur_nrx_ct,
+NULL as prev_nrx_ct,
+NULL as cur_mkt_nrx_ct,
+NULL as prev_mkt_nrx_ct,
+NULL as cur_nbrx_ct,
+NULL as prev_nbrx_ct,
+NULL as cur_mkt_nbrx_ct,
+NULL as prev_mkt_nbrx_ct,
+NULL as cur_uvrs_ct,
+NULL as cur_trlst_ct,
+NULL as prev_trlst_ct,
+NULL as cur_rptr_ct,
+NULL as prev_rptr_ct,
+NULL as cur_adpt_ct,
+NULL as prev_adptr_ct,
+NULL as totl_adpt_dpth,
+NULL as bob_adpt_dpth,
+NULL as trgt_adpt_dpth,
+NULL as cur_tot_wrtr,
+NULL as prev_tot_wrtr,
+clm.cur_dmnd_unit,
+clm.prev_dmnd_unit,
+clm.cur_mkt_dmnd_unit,
+clm.prev_mkt_dmnd_unit,
+NULL as cur_ddd_unit,
+NULL as prev_ddd_unit,
+NULL as cur_mkt_ddd_unit,
+NULL as prev_mkt_ddd_unit,
+NULL as cur_sp_unit,
+NULL as prev_sp_unit,
+NULL as cur_sd_unit,
+NULL as prev_sd_unit,
+NULL as cur_unit,
+NULL as prev_unit,
+NULL as cur_sd_vial,
+NULL as prev_sd_vial,
+NULL as cur_wrtr_sd_ct,
+NULL as prev_wrtr_sd_ct,
+NULL as cur_actv_shp_pat_ct,
+NULL as cur_actv_all_pat_ct,
+NULL as cur_new_pat_ct,
+NULL as prev_new_pat_ct,
+NULL as cur_net_ref_ct,
+NULL as prev_net_ref_ct,
+NULL as cur_rch_pct,
+NULL as cur_rch_high_pct,
+NULL as cur_totl_cpd_ct,
+NULL as cur_trgt_cpd_ct,
+NULL as cur_tdfa_pct,
+NULL as cur_tdfa_high_pct,
+NULL as dscn_ach,
+NULL as trgt_dscn_ach,
+NULL as dscn_asgn,
+NULL as p1_dscn_ach,
+NULL as p2_dscn_ach,
+NULL as p1_dscn_asgn,
+NULL as p2_dscn_asgn,
+clm.src_load_dt as src_load_dt
+from
+{from_publish_schema_name}.f_mat_claim_pat_geo clm
+join
+{from_publish_schema_name}.d_aligt_geo algt
+on
+clm.geo_id = algt.geo_id
+join
+cfg_tb_mkt_rstrct_df tb
+on 
+clm.tb_id = tb.tb_id
+and clm.mkt_nm = tb.mkt_nm
+join 
+{from_publish_schema_name}.d_seg seg
+on
+clm.seg_val_id=seg.seg_val_id
+""")
+temp_claim_pat_sls_df.createOrReplaceTempView('temp_claim_pat_sls_df')
+temp_ddd_geo_sls_df = spark.sql(f"""
+select
+/*+ broadcast(algt,tb,cfg) */
+ddd.tb_id,
+tb.tb_cd,
+ddd.geo_id,
+ddd.geo_ds,
+algt.team_id,
+algt.team_nm,
+ddd.az_mkt_id,
+ddd.mkt_nm,
+ddd.brd_fam_id,
+ddd.brd_fam_ds,
+upper(seg.seg_type) as seg_type,
+ddd.hca_seg_id as seg_val_id,
+NULL as cur_trx_ct,
+NULL as prev_trx_ct,
+NULL as cur_mkt_trx_ct,
+NULL as prev_mkt_trx_ct,
+NULL as cur_nrx_ct,
+NULL as prev_nrx_ct,
+NULL as cur_mkt_nrx_ct,
+NULL as prev_mkt_nrx_ct,
+NULL as cur_nbrx_ct,
+NULL as prev_nbrx_ct,
+NULL as cur_mkt_nbrx_ct,
+NULL as prev_mkt_nbrx_ct,
+NULL as cur_uvrs_ct,
+NULL as cur_trlst_ct,
+NULL as prev_trlst_ct,
+NULL as cur_rptr_ct,
+NULL as prev_rptr_ct,
+NULL as cur_adpt_ct,
+NULL as prev_adptr_ct,
+NULL as totl_adpt_dpth,
+NULL as bob_adpt_dpth,
+NULL as trgt_adpt_dpth,
+NULL as cur_tot_wrtr,
+NULL as prev_tot_wrtr,
+NULL as cur_dmnd_unit,
+NULL as prev_dmnd_unit,
+NULL as cur_mkt_dmnd_unit,
+NULL as prev_mkt_dmnd_unit,
+ddd.cur_ddd_unit,
+ddd.prev_ddd_unit,
+ddd.cur_mkt_ddd_unit,
+ddd.prev_mkt_ddd_unit,
+NULL as cur_sp_unit,
+NULL as prev_sp_unit,
+NULL as cur_sd_unit,
+NULL as prev_sd_unit,
+NULL as cur_unit,
+NULL as prev_unit,
+NULL as cur_sd_vial,
+NULL as prev_sd_vial,
+NULL as cur_wrtr_sd_ct,
+NULL as prev_wrtr_sd_ct,
+NULL as cur_actv_shp_pat_ct,
+NULL as cur_actv_all_pat_ct,
+NULL as cur_new_pat_ct,
+NULL as prev_new_pat_ct,
+NULL as cur_net_ref_ct,
+NULL as prev_net_ref_ct,
+NULL as cur_rch_pct,
+NULL as cur_rch_high_pct,
+NULL as cur_totl_cpd_ct,
+NULL as cur_trgt_cpd_ct,
+NULL as cur_tdfa_pct,
+NULL as cur_tdfa_high_pct,
+NULL as dscn_ach,
+NULL as trgt_dscn_ach,
+NULL as dscn_asgn,
+NULL as p1_dscn_ach,
+NULL as p2_dscn_ach,
+NULL as p1_dscn_asgn,
+NULL as p2_dscn_asgn,
+ddd.load_dt as src_load_dt
+from
+{from_publish_schema_name}.f_mat_sls_ddd_geo ddd    
+join
+{from_publish_schema_name}.d_aligt_geo algt
+on
+ddd.geo_id = algt.geo_id
+join
+cfg_tb_mkt_rstrct_df tb
+on 
+ddd.tb_id = tb.tb_id
+and ddd.mkt_nm = tb.mkt_nm
+join
+cfg_gner_parm_val_df cfg
+on
+lower(cfg.tbl_nm) = 'f_mat_geo_smry'
+and lower(cfg.parm_type) = 'ddd_perf'
+and upper(cfg.val) = upper(ddd.mkt_nm)
+and upper(cfg.attr1) = upper(algt.team_nm)
+and upper(cfg.attr2) = upper(ddd.chnl_nm)
+join 
+{from_publish_schema_name}.d_seg seg
+on
+ddd.hca_seg_id=seg.seg_val_id
+""")
+temp_ddd_geo_sls_df.createOrReplaceTempView('temp_ddd_geo_sls_df')
+temp_ddd_geo_dtl_sls_df = spark.sql(f"""
+select 
+/*+ broadcast(algt,tb,cfg) */
+ddd.tb_id,
+tb.tb_cd,
+ddd.geo_id,
+ddd.geo_ds,
+algt.team_id,
+algt.team_nm,
+ddd.az_mkt_id,
+ddd.mkt_nm,
+ddd.brd_fam_id,
+ddd.brd_fam_ds,
+case when ddd.prty_seg_ds = 'TOTAL' then 'GEOGRAPHY' else 'PRIORITY' end as seg_type,
+ddd.prty_seg_id as seg_val_id,
+NULL as cur_trx_ct,
+NULL as prev_trx_ct,
+NULL as cur_mkt_trx_ct,
+NULL as prev_mkt_trx_ct,
+NULL as cur_nrx_ct,
+NULL as prev_nrx_ct,
+NULL as cur_mkt_nrx_ct,
+NULL as prev_mkt_nrx_ct,
+NULL as cur_nbrx_ct,
+NULL as prev_nbrx_ct,
+NULL as cur_mkt_nbrx_ct,
+NULL as prev_mkt_nbrx_ct,
+NULL as cur_uvrs_ct,
+NULL as cur_trlst_ct,
+NULL as prev_trlst_ct,
+NULL as cur_rptr_ct,
+NULL as prev_rptr_ct,
+NULL as cur_adpt_ct,
+NULL as prev_adptr_ct,
+NULL as totl_adpt_dpth,
+NULL as bob_adpt_dpth,
+NULL as trgt_adpt_dpth,
+NULL as cur_tot_wrtr,
+NULL as prev_tot_wrtr,
+NULL as cur_dmnd_unit,
+NULL as prev_dmnd_unit,
+NULL as cur_mkt_dmnd_unit,
+NULL as prev_mkt_dmnd_unit,
+ddd.cur_ddd_unit,
+ddd.prev_ddd_unit,
+ddd.cur_mkt_ddd_unit,
+ddd.prev_mkt_ddd_unit,
+NULL as cur_sp_unit,
+NULL as prev_sp_unit,
+NULL as cur_sd_unit,
+NULL as prev_sd_unit,
+NULL as cur_unit,
+NULL as prev_unit,
+NULL as cur_sd_vial,
+NULL as prev_sd_vial,
+NULL as cur_wrtr_sd_ct,
+NULL as prev_wrtr_sd_ct,
+NULL as cur_actv_shp_pat_ct,
+NULL as cur_actv_all_pat_ct,
+NULL as cur_new_pat_ct,
+NULL as prev_new_pat_ct,
+NULL as cur_net_ref_ct,
+NULL as prev_net_ref_ct,
+NULL as cur_rch_pct,
+NULL as cur_rch_high_pct,
+NULL as cur_totl_cpd_ct,
+NULL as cur_trgt_cpd_ct,
+NULL as cur_tdfa_pct,
+NULL as cur_tdfa_high_pct,
+NULL as dscn_ach,
+NULL as trgt_dscn_ach,
+NULL as dscn_asgn,
+NULL as p1_dscn_ach,
+NULL as p2_dscn_ach,
+NULL as p1_dscn_asgn,
+NULL as p2_dscn_asgn,
+ddd.src_load_dt as src_load_dt
+from
+{from_publish_schema_name}.f_mat_sls_ddd_geo_dtl ddd
+join
+{from_publish_schema_name}.d_aligt_geo algt
+on
+ddd.geo_id = algt.geo_id
+join
+cfg_tb_mkt_rstrct_df tb
+on 
+ddd.tb_id = tb.tb_id
+and ddd.mkt_nm = tb.mkt_nm
+join 
+{from_publish_schema_name}.d_seg seg
+on
+ddd.prty_seg_id=seg.seg_val_id
+""")
+temp_ddd_geo_dtl_sls_df.createOrReplaceTempView('temp_ddd_geo_dtl_sls_df')
+# Step 15: Merge the above DDD Dataframes
+temp_ddd_sls_final_df = temp_ddd_geo_sls_df.unionAll(temp_ddd_geo_dtl_sls_df)
+temp_ddd_sls_final_df.createOrReplaceTempView('temp_ddd_sls_final_df')
+temp_spsd_geo_sls_df = spark.sql(f"""
+select
+/*+ broadcast(algt,tb,cfg) */
+spsd.tb_id,
+tb.tb_cd,
+spsd.geo_id,
+spsd.geo_ds,
+algt.team_id,
+algt.team_nm,
+spsd.az_mkt_id,
+spsd.mkt_nm,
+spsd.brd_fam_id,
+spsd.brd_fam_ds,
+upper(seg.seg_type) as seg_type,
+spsd.seg_val_id,
+NULL as cur_trx_ct,
+NULL as prev_trx_ct,
+NULL as cur_mkt_trx_ct,
+NULL as prev_mkt_trx_ct,
+NULL as cur_nrx_ct,
+NULL as prev_nrx_ct,
+NULL as cur_mkt_nrx_ct,
+NULL as prev_mkt_nrx_ct,
+NULL as cur_nbrx_ct,
+NULL as prev_nbrx_ct,
+NULL as cur_mkt_nbrx_ct,
+NULL as prev_mkt_nbrx_ct,
+NULL as cur_uvrs_ct,
+NULL as cur_trlst_ct,
+NULL as prev_trlst_ct,
+NULL as cur_rptr_ct,
+NULL as prev_rptr_ct,
+NULL as cur_adpt_ct,
+NULL as prev_adptr_ct,
+NULL as totl_adpt_dpth,
+NULL as bob_adpt_dpth,
+NULL as trgt_adpt_dpth,
+NULL as cur_tot_wrtr,
+NULL as prev_tot_wrtr,
+NULL as cur_dmnd_unit,
+NULL as prev_dmnd_unit,
+NULL as cur_mkt_dmnd_unit,
+NULL as prev_mkt_dmnd_unit,
+NULL as cur_ddd_unit,
+NULL as prev_ddd_unit,
+NULL as cur_mkt_ddd_unit,
+NULL as prev_mkt_ddd_unit,
+spsd.cur_sp_unit,
+spsd.prev_sp_unit,
+spsd.cur_sd_unit,
+spsd.prev_sd_unit,
+spsd.cur_unit,
+spsd.prev_unit,
+spsd.cur_sd_vial,
+spsd.prev_sd_vial,
+spsd.cur_wrtr_sd_ct,
+spsd.prev_wrtr_sd_ct,
+spsd.cur_actv_shp_pat_ct,
+spsd.cur_actv_all_pat_ct,
+spsd.cur_new_pat_ct,
+spsd.prev_new_pat_ct,
+spsd.cur_net_ref_ct,
+spsd.prev_net_ref_ct,
+NULL as cur_rch_pct,
+NULL as cur_rch_high_pct,
+NULL as cur_totl_cpd_ct,
+NULL as cur_trgt_cpd_ct,
+NULL as cur_tdfa_pct,
+NULL as cur_tdfa_high_pct,
+NULL as dscn_ach,
+NULL as trgt_dscn_ach,
+NULL as dscn_asgn,
+NULL as p1_dscn_ach,
+NULL as p2_dscn_ach,
+NULL as p1_dscn_asgn,
+NULL as p2_dscn_asgn,
+spsd.src_load_dt as src_load_dt
+from
+{from_publish_schema_name}.f_mat_bio_sls_spsd_geo spsd 
+join
+cfg_tb_mkt_rstrct_df tb
+on 
+spsd.tb_id = tb.tb_id 
+and spsd.mkt_nm = tb.mkt_nm
+join
+{from_publish_schema_name}.d_aligt_geo algt
+on
+spsd.geo_id = algt.geo_id    
+join
+cfg_gner_parm_val_df cfg
+on
+lower(cfg.tbl_nm) = 'f_mat_geo_smry'
+and lower(cfg.parm_type) = 'spsd_perf'
+and upper(cfg.val) = upper(spsd.mkt_nm)
+and upper(cfg.attr1) = upper(algt.team_nm)
+and upper(cfg.attr2) = upper(spsd.chnl_seg_ds)
+join 
+{from_publish_schema_name}.d_seg seg
+on
+spsd.seg_val_id=seg.seg_val_id
+""")
+temp_spsd_geo_sls_df.createOrReplaceTempView('temp_spsd_geo_sls_df')
+cfg_tb_mkt_rstrct_df.unpersist()
+temp_acty_call_geo_sls_df = spark.sql(f"""
+select
+/*+ broadcast(algt,cfg) */
+acty.tb_id,
+acty.geo_id,
+acty.team_id,
+algt.team_nm,
+case when upper(trgt_flg) = 'TOTAL' then (call_ach/dot) else 0 end as cur_totl_cpd_ct,
+case when upper(trgt_flg) = 'TARGET' then (call_ach/dot) else 0 end as cur_trgt_cpd_ct
+from
+{from_publish_schema_name}.f_mat_acty_call_geo acty 
+join
+d_aligt_df algt
+on
+acty.team_id = algt.team_id 
+join
+cfg_gner_parm_val_df cfg
+on
+lower(trim(tbl_nm))='f_mat_geo_smry'
+and  lower(trim(parm_type))='exec_call_perf'
+and upper(trim(cfg.val)) = upper(algt.team_nm)
+and upper(trim(cfg.attr1)) = upper(acty.cust_clas)
+and upper(trim(cfg.attr2)) = upper(acty.non_pscbr_atnde_flg)
+""")
+temp_acty_call_geo_sls_df.createOrReplaceTempView('temp_acty_call_geo_sls_df')
+d_aligt_df.unpersist() 
+temp_acty_call_geo_sls_df.persist(StorageLevel.MEMORY_AND_DISK)
+temp_acty_dscn_call_geo_sls_df_1 = spark.sql(f"""
+select
+/*+ broadcast(epa,tb,cfg) */
+acty.tb_id,
+tb.nw_tb_cd as tb_cd,
+acty.geo_id,
+epa.geo_ds,
+acty.team_id,
+epa.team_nm,
+acty.az_mkt_id,
+epa.mkt_nm,
+acty.brd_fam_id,
+epa.brd_fam_ds,
+upper(seg.seg_type) as seg_type,
+acty.seg_1_id as seg_val_id,
+NULL as cur_trx_ct,
+NULL as prev_trx_ct,
+NULL as cur_mkt_trx_ct,
+NULL as prev_mkt_trx_ct,
+NULL as cur_nrx_ct,
+NULL as prev_nrx_ct,
+NULL as cur_mkt_nrx_ct,
+NULL as prev_mkt_nrx_ct,
+NULL as cur_nbrx_ct,
+NULL as prev_nbrx_ct,
+NULL as cur_mkt_nbrx_ct,
+NULL as prev_mkt_nbrx_ct,
+NULL as cur_uvrs_ct,
+NULL as cur_trlst_ct,
+NULL as prev_trlst_ct,
+NULL as cur_rptr_ct,
+NULL as prev_rptr_ct,
+NULL as cur_adpt_ct,
+NULL as prev_adptr_ct,
+NULL as totl_adpt_dpth,
+NULL as bob_adpt_dpth,
+NULL as trgt_adpt_dpth,
+NULL as cur_tot_wrtr,
+NULL as prev_tot_wrtr,
+NULL as cur_dmnd_unit,
+NULL as prev_dmnd_unit,
+NULL as cur_mkt_dmnd_unit,
+NULL as prev_mkt_dmnd_unit,
+NULL as cur_ddd_unit,
+NULL as prev_ddd_unit,
+NULL as cur_mkt_ddd_unit,
+NULL as prev_mkt_ddd_unit,
+NULL as cur_sp_unit,
+NULL as prev_sp_unit,
+NULL as cur_sd_unit,
+NULL as prev_sd_unit,
+NULL as cur_unit,
+NULL as prev_unit,
+NULL as cur_sd_vial,
+NULL as prev_sd_vial,
+NULL as cur_wrtr_sd_ct,
+NULL as prev_wrtr_sd_ct,
+NULL as cur_actv_shp_pat_ct,
+NULL as cur_actv_all_pat_ct,
+NULL as cur_new_pat_ct,
+NULL as prev_new_pat_ct,
+NULL as cur_net_ref_ct,
+NULL as prev_net_ref_ct,
+acty.cuml_rch_pct as cur_rch_pct,
+NULL as cur_rch_high_pct,
+coalesce(call.cur_totl_cpd_ct,0) as cur_totl_cpd_ct,
+coalesce(call.cur_trgt_cpd_ct,0) as cur_trgt_cpd_ct,
+acty.cuml_tdfa_pct as cur_tdfa_pct,
+NULL as cur_tdfa_high_pct,
+acty.dscn_ach,
+acty.trgt_dscn_ach,
+acty.dscn_asgn,
+acty.p1_dscn_ach,
+acty.p2_dscn_ach,
+acty.p1_dscn_asgn,
+acty.p2_dscn_asgn,
+acty.src_load_dt
+from
+{from_publish_schema_name}.f_mat_acty_dscn_geo acty
+join
+tm_mkt_prd_df epa
+on
+acty.geo_id = epa.geo_id
+and acty.az_mkt_id = epa.az_mkt_id 
+and acty.brd_fam_id = epa.brd_fam_id
+join
+cfg_tb_mkt_exec_rstrct_df tb
+on 
+acty.tb_id = tb.tb_id
+and epa.mkt_nm = tb.mkt_nm
+join
+cfg_gner_parm_val_df cfg
+on
+lower(trim(tbl_nm))='f_mat_geo_smry'
+and  lower(trim(parm_type))='exec_dscn_perf'
+and upper(trim(cfg.val)) = upper(epa.team_nm)
+and upper(trim(cfg.attr1)) = upper(epa.mkt_nm)
+and upper(trim(cfg.attr2)) = upper(acty.cust_clas)
+left join 
+temp_acty_call_geo_sls_df call
+on
+acty.tb_id    = call.tb_id  
+and acty.geo_id   = call.geo_id 
+and acty.team_id  = call.team_id
+join {from_publish_schema_name}.d_seg seg
+on seg.seg_val_id=acty.seg_1_id
+and upper(trim(acty.seg_2_ds))='ALL'
+and upper(trim(acty.seg_1_ds))<>'ALL'
+""")
+temp_acty_dscn_call_geo_sls_df_1.createOrReplaceTempView('temp_acty_dscn_call_geo_sls_df_1')
+temp_acty_dscn_call_geo_sls_df_2 = spark.sql(f"""
+select
+/*+ broadcast(epa,tb,cfg) */
+acty.tb_id,
+tb.nw_tb_cd as tb_cd,
+acty.geo_id,
+epa.geo_ds,
+acty.team_id,
+epa.team_nm,
+acty.az_mkt_id,
+epa.mkt_nm,
+acty.brd_fam_id,
+epa.brd_fam_ds,
+upper(seg.seg_type) as seg_type,
+acty.seg_2_id as seg_val_id,
+NULL as cur_trx_ct,
+NULL as prev_trx_ct,
+NULL as cur_mkt_trx_ct,
+NULL as prev_mkt_trx_ct,
+NULL as cur_nrx_ct,
+NULL as prev_nrx_ct,
+NULL as cur_mkt_nrx_ct,
+NULL as prev_mkt_nrx_ct,
+NULL as cur_nbrx_ct,
+NULL as prev_nbrx_ct,
+NULL as cur_mkt_nbrx_ct,
+NULL as prev_mkt_nbrx_ct,
+NULL as cur_uvrs_ct,
+NULL as cur_trlst_ct,
+NULL as prev_trlst_ct,
+NULL as cur_rptr_ct,
+NULL as prev_rptr_ct,
+NULL as cur_adpt_ct,
+NULL as prev_adptr_ct,
+NULL as totl_adpt_dpth,
+NULL as bob_adpt_dpth,
+NULL as trgt_adpt_dpth,
+NULL as cur_tot_wrtr,
+NULL as prev_tot_wrtr,
+NULL as cur_dmnd_unit,
+NULL as prev_dmnd_unit,
+NULL as cur_mkt_dmnd_unit,
+NULL as prev_mkt_dmnd_unit,
+NULL as cur_ddd_unit,
+NULL as prev_ddd_unit,
+NULL as cur_mkt_ddd_unit,
+NULL as prev_mkt_ddd_unit,
+NULL as cur_sp_unit,
+NULL as prev_sp_unit,
+NULL as cur_sd_unit,
+NULL as prev_sd_unit,
+NULL as cur_unit,
+NULL as prev_unit,
+NULL as cur_sd_vial,
+NULL as prev_sd_vial,
+NULL as cur_wrtr_sd_ct,
+NULL as prev_wrtr_sd_ct,
+NULL as cur_actv_shp_pat_ct,
+NULL as cur_actv_all_pat_ct,
+NULL as cur_new_pat_ct,
+NULL as prev_new_pat_ct,
+NULL as cur_net_ref_ct,
+NULL as prev_net_ref_ct,
+acty.cuml_rch_pct as cur_rch_pct,
+NULL as cur_rch_high_pct,
+coalesce(call.cur_totl_cpd_ct, 0) as cur_totl_cpd_ct,
+coalesce(call.cur_trgt_cpd_ct, 0) as cur_trgt_cpd_ct,
+acty.cuml_tdfa_pct as cur_tdfa_pct,
+NULL as cur_tdfa_high_pct,
+acty.dscn_ach,
+acty.trgt_dscn_ach,
+acty.dscn_asgn,
+acty.p1_dscn_ach,
+acty.p2_dscn_ach,
+acty.p1_dscn_asgn,
+acty.p2_dscn_asgn,
+acty.src_load_dt
+from
+{from_publish_schema_name}.f_mat_acty_dscn_geo acty
+join
+tm_mkt_prd_df epa
+on
+acty.geo_id = epa.geo_id
+and acty.az_mkt_id = epa.az_mkt_id 
+and acty.brd_fam_id = epa.brd_fam_id
+join
+cfg_tb_mkt_exec_rstrct_df tb
+on 
+acty.tb_id = tb.tb_id
+and epa.mkt_nm = tb.mkt_nm
+join
+cfg_gner_parm_val_df cfg
+on
+lower(trim(tbl_nm))='f_mat_geo_smry'
+and  lower(trim(parm_type))='exec_dscn_perf'
+and upper(trim(cfg.val)) = upper(epa.team_nm)
+and upper(trim(cfg.attr1)) = upper(epa.mkt_nm)
+and upper(trim(cfg.attr2)) = upper(acty.cust_clas)
+left join 
+temp_acty_call_geo_sls_df call
+on
+acty.tb_id    = call.tb_id  
+and acty.geo_id   = call.geo_id 
+and acty.team_id  = call.team_id
+join {from_publish_schema_name}.d_seg seg
+on seg.seg_val_id=acty.seg_2_id
+and upper(trim(acty.seg_1_ds))='ALL'
+and upper(trim(acty.seg_2_ds))<>'ALL'
+""")
+temp_acty_dscn_call_geo_sls_df_2.createOrReplaceTempView('temp_acty_dscn_call_geo_sls_df_2')
+temp_acty_dscn_call_geo_sls_df_3=spark.sql(f"""
+SELECT
+acty.tb_id,
+tb.nw_tb_cd as tb_cd,
+acty.geo_id,
+epa.geo_ds,
+acty.team_id,
+epa.team_nm,
+acty.az_mkt_id,
+epa.mkt_nm,
+acty.brd_fam_id,
+epa.brd_fam_ds,
+upper(seg.seg_type) as seg_type,
+substring(sha2(concat(concat(lower(trim(attr2)), "-", lower(trim(attr3))), concat(seg_1_ds,"-", seg_2_ds)), 256), 1, 16) as seg_val_id,
+NULL as cur_trx_ct,
+NULL as prev_trx_ct,
+NULL as cur_mkt_trx_ct,
+NULL as prev_mkt_trx_ct,
+NULL as cur_nrx_ct,
+NULL as prev_nrx_ct,
+NULL as cur_mkt_nrx_ct,
+NULL as prev_mkt_nrx_ct,
+NULL as cur_nbrx_ct,
+NULL as prev_nbrx_ct,
+NULL as cur_mkt_nbrx_ct,
+NULL as prev_mkt_nbrx_ct,
+NULL as cur_uvrs_ct,
+NULL as cur_trlst_ct,
+NULL as prev_trlst_ct,
+NULL as cur_rptr_ct,
+NULL as prev_rptr_ct,
+NULL as cur_adpt_ct,
+NULL as prev_adptr_ct,
+NULL as totl_adpt_dpth,
+NULL as bob_adpt_dpth,
+NULL as trgt_adpt_dpth,
+NULL as cur_tot_wrtr,
+NULL as prev_tot_wrtr,
+NULL as cur_dmnd_unit,
+NULL as prev_dmnd_unit,
+NULL as cur_mkt_dmnd_unit,
+NULL as prev_mkt_dmnd_unit,
+NULL as cur_ddd_unit,
+NULL as prev_ddd_unit,
+NULL as cur_mkt_ddd_unit,
+NULL as prev_mkt_ddd_unit,
+NULL as cur_sp_unit,
+NULL as prev_sp_unit,
+NULL as cur_sd_unit,
+NULL as prev_sd_unit,
+NULL as cur_unit,
+NULL as prev_unit,
+NULL as cur_sd_vial,
+NULL as prev_sd_vial,
+NULL as cur_wrtr_sd_ct,
+NULL as prev_wrtr_sd_ct,
+NULL as cur_actv_shp_pat_ct,
+NULL as cur_actv_all_pat_ct,
+NULL as cur_new_pat_ct,
+NULL as prev_new_pat_ct,
+NULL as cur_net_ref_ct,
+NULL as prev_net_ref_ct,
+acty.cuml_rch_pct as cur_rch_pct,
+NULL as cur_rch_high_pct,
+coalesce(call.cur_totl_cpd_ct, 0) as cur_totl_cpd_ct,
+coalesce(call.cur_trgt_cpd_ct, 0) as cur_trgt_cpd_ct,
+acty.cuml_tdfa_pct as cur_tdfa_pct,
+NULL as cur_tdfa_high_pct,
+acty.dscn_ach,
+acty.trgt_dscn_ach,
+acty.dscn_asgn,
+acty.p1_dscn_ach,
+acty.p2_dscn_ach,
+acty.p1_dscn_asgn,
+acty.p2_dscn_asgn,
+acty.src_load_dt
+from
+{from_publish_schema_name}.f_mat_acty_dscn_geo acty
+join
+tm_mkt_prd_df epa
+on
+acty.geo_id = epa.geo_id
+and acty.az_mkt_id = epa.az_mkt_id 
+and acty.brd_fam_id = epa.brd_fam_id
+join
+cfg_tb_mkt_exec_rstrct_df tb
+on 
+acty.tb_id = tb.tb_id
+and epa.mkt_nm = tb.mkt_nm
+join
+cfg_gner_parm_val_df cfg
+on
+lower(trim(tbl_nm))='f_mat_geo_smry'
+and  lower(trim(parm_type))='cust_seg_excluded'
+and upper(trim(cfg.val)) = upper(epa.team_nm)
+and upper(trim(cfg.attr1)) = upper(epa.mkt_nm)
+left join 
+temp_acty_call_geo_sls_df call
+on
+acty.tb_id    = call.tb_id  
+and acty.geo_id   = call.geo_id 
+and acty.team_id  = call.team_id
+join {from_publish_schema_name}.d_seg seg
+on seg.seg_val_id=substring(sha2(concat(concat(lower(trim(attr2)), "-", lower(trim(attr3))), concat(seg_1_ds,"-", seg_2_ds)), 256), 1, 16)
+and upper(trim(acty.seg_1_ds))<>'ALL'
+and upper(trim(acty.seg_2_ds))<>'ALL'
+""")
+temp_acty_dscn_call_geo_sls_df_3.createOrReplaceTempView('temp_acty_dscn_call_geo_sls_df_3')
+temp_acty_dscn_call_geo_sls_df_4 = spark.sql(f"""
+select
+/*+ broadcast(epa,tb,cfg) */
+acty.tb_id,
+tb.nw_tb_cd as tb_cd,
+acty.geo_id,
+epa.geo_ds,
+acty.team_id,
+epa.team_nm,
+acty.az_mkt_id,
+epa.mkt_nm,
+acty.brd_fam_id,
+epa.brd_fam_ds,
+'GEOGRAPHY' as seg_type,
+0 as seg_val_id,
+NULL as cur_trx_ct,
+NULL as prev_trx_ct,
+NULL as cur_mkt_trx_ct,
+NULL as prev_mkt_trx_ct,
+NULL as cur_nrx_ct,
+NULL as prev_nrx_ct,
+NULL as cur_mkt_nrx_ct,
+NULL as prev_mkt_nrx_ct,
+NULL as cur_nbrx_ct,
+NULL as prev_nbrx_ct,
+NULL as cur_mkt_nbrx_ct,
+NULL as prev_mkt_nbrx_ct,
+NULL as cur_uvrs_ct,
+NULL as cur_trlst_ct,
+NULL as prev_trlst_ct,
+NULL as cur_rptr_ct,
+NULL as prev_rptr_ct,
+NULL as cur_adpt_ct,
+NULL as prev_adptr_ct,
+NULL as totl_adpt_dpth,
+NULL as bob_adpt_dpth,
+NULL as trgt_adpt_dpth,
+NULL as cur_tot_wrtr,
+NULL as prev_tot_wrtr,
+NULL as cur_dmnd_unit,
+NULL as prev_dmnd_unit,
+NULL as cur_mkt_dmnd_unit,
+NULL as prev_mkt_dmnd_unit,
+NULL as cur_ddd_unit,
+NULL as prev_ddd_unit,
+NULL as cur_mkt_ddd_unit,
+NULL as prev_mkt_ddd_unit,
+NULL as cur_sp_unit,
+NULL as prev_sp_unit,
+NULL as cur_sd_unit,
+NULL as prev_sd_unit,
+NULL as cur_unit,
+NULL as prev_unit,
+NULL as cur_sd_vial,
+NULL as prev_sd_vial,
+NULL as cur_wrtr_sd_ct,
+NULL as prev_wrtr_sd_ct,
+NULL as cur_actv_shp_pat_ct,
+NULL as cur_actv_all_pat_ct,
+NULL as cur_new_pat_ct,
+NULL as prev_new_pat_ct,
+NULL as cur_net_ref_ct,
+NULL as prev_net_ref_ct,
+acty.cuml_rch_pct as cur_rch_pct,
+NULL as cur_rch_high_pct,
+coalesce(call.cur_totl_cpd_ct, 0) as cur_totl_cpd_ct,
+coalesce(call.cur_trgt_cpd_ct, 0) as cur_trgt_cpd_ct,
+acty.cuml_tdfa_pct as cur_tdfa_pct,
+NULL as cur_tdfa_high_pct,
+acty.dscn_ach,
+acty.trgt_dscn_ach,
+acty.dscn_asgn,
+acty.p1_dscn_ach,
+acty.p2_dscn_ach,
+acty.p1_dscn_asgn,
+acty.p2_dscn_asgn,
+acty.src_load_dt as src_load_dt
+from
+{from_publish_schema_name}.f_mat_acty_dscn_geo acty
+join
+tm_mkt_prd_df epa
+on
+acty.geo_id = epa.geo_id
+and acty.az_mkt_id = epa.az_mkt_id 
+and acty.brd_fam_id = epa.brd_fam_id
+join
+cfg_tb_mkt_exec_rstrct_df tb
+on 
+acty.tb_id = tb.tb_id
+and epa.mkt_nm = tb.mkt_nm
+join
+cfg_gner_parm_val_df cfg
+on
+lower(trim(tbl_nm))='f_mat_geo_smry'
+and  lower(trim(parm_type))='exec_dscn_perf'
+and upper(trim(cfg.val)) = upper(epa.team_nm)
+and upper(trim(cfg.attr1)) = upper(epa.mkt_nm)
+and upper(trim(cfg.attr2)) = upper(acty.cust_clas)
+left join 
+temp_acty_call_geo_sls_df call
+on
+acty.tb_id    = call.tb_id  
+and acty.geo_id   = call.geo_id 
+and acty.team_id  = call.team_id
+where upper(trim(acty.seg_1_ds))='ALL'
+and upper(trim(acty.seg_2_ds))='ALL'
+""")
+temp_acty_dscn_call_geo_sls_df_4.createOrReplaceTempView('temp_acty_dscn_call_geo_sls_df_4')
+cfg_tb_mkt_exec_rstrct_df.unpersist()
+temp_acty_call_geo_sls_df.unpersist()
+temp_acty_dscn_call_geo_sls_df=temp_acty_dscn_call_geo_sls_df_1.unionAll(temp_acty_dscn_call_geo_sls_df_2).unionAll(temp_acty_dscn_call_geo_sls_df_4).unionAll(temp_acty_dscn_call_geo_sls_df_3)
+temp_acty_dscn_call_geo_sls_df.createOrReplaceTempView('temp_acty_dscn_call_geo_sls_df')
+temp_acty_dscn_call_geo_sls_df_aggr = spark.sql("""
+SELECT
+tb_id,
+tb_cd,
+geo_id,
+geo_ds,
+team_id,
+team_nm,
+az_mkt_id,
+mkt_nm,
+brd_fam_id,
+brd_fam_ds,
+upper(seg_type) as seg_type,
+seg_val_id,
+CAST(COALESCE(MAX(cur_trx_ct), 0) AS DOUBLE) AS cur_trx_ct,
+CAST(COALESCE(MAX(prev_trx_ct), 0) AS DOUBLE) AS prev_trx_ct,
+CAST(COALESCE(MAX(cur_mkt_trx_ct), 0) AS DOUBLE) AS cur_mkt_trx_ct,
+CAST(COALESCE(MAX(prev_mkt_trx_ct), 0) AS DOUBLE) AS prev_mkt_trx_ct,
+CAST(COALESCE(MAX(cur_nrx_ct), 0) AS DOUBLE) AS cur_nrx_ct,
+CAST(COALESCE(MAX(prev_nrx_ct), 0) AS DOUBLE) AS prev_nrx_ct,
+CAST(COALESCE(MAX(cur_mkt_nrx_ct), 0) AS DOUBLE) AS cur_mkt_nrx_ct,
+CAST(COALESCE(MAX(prev_mkt_nrx_ct), 0) AS DOUBLE) AS prev_mkt_nrx_ct,
+CAST(COALESCE(MAX(cur_nbrx_ct), 0) AS DOUBLE) AS cur_nbrx_ct,
+CAST(COALESCE(MAX(prev_nbrx_ct), 0) AS DOUBLE) AS prev_nbrx_ct,
+CAST(COALESCE(MAX(cur_mkt_nbrx_ct), 0) AS DOUBLE) AS cur_mkt_nbrx_ct,
+CAST(COALESCE(MAX(prev_mkt_nbrx_ct), 0) AS DOUBLE) AS prev_mkt_nbrx_ct,
+CAST(COALESCE(MAX(cur_uvrs_ct), 0) AS DOUBLE) AS cur_uvrs_ct,
+CAST(COALESCE(MAX(cur_trlst_ct), 0) AS DOUBLE) AS cur_trlst_ct,
+CAST(COALESCE(MAX(prev_trlst_ct), 0) AS DOUBLE) AS prev_trlst_ct,
+CAST(COALESCE(MAX(cur_rptr_ct), 0) AS DOUBLE) AS cur_rptr_ct,
+CAST(COALESCE(MAX(prev_rptr_ct), 0) AS DOUBLE) AS prev_rptr_ct,
+CAST(COALESCE(MAX(cur_adpt_ct), 0) AS DOUBLE) AS cur_adpt_ct,
+CAST(COALESCE(MAX(prev_adptr_ct), 0) AS DOUBLE) AS prev_adptr_ct,
+CAST(COALESCE(MAX(totl_adpt_dpth), 0) AS DOUBLE) AS totl_adpt_dpth,
+CAST(COALESCE(MAX(bob_adpt_dpth), 0) AS DOUBLE) AS bob_adpt_dpth,
+CAST(COALESCE(MAX(trgt_adpt_dpth), 0) AS DOUBLE) AS trgt_adpt_dpth,
+CAST(COALESCE(MAX(cur_tot_wrtr), 0) AS DOUBLE) AS cur_tot_wrtr,
+CAST(COALESCE(MAX(prev_tot_wrtr), 0) AS DOUBLE) AS prev_tot_wrtr,
+CAST(COALESCE(MAX(cur_dmnd_unit), 0) AS DOUBLE) AS cur_dmnd_unit,
+CAST(COALESCE(MAX(prev_dmnd_unit), 0) AS DOUBLE) AS prev_dmnd_unit,
+CAST(COALESCE(MAX(cur_mkt_dmnd_unit), 0) AS DOUBLE) AS cur_mkt_dmnd_unit,
+CAST(COALESCE(MAX(prev_mkt_dmnd_unit), 0) AS DOUBLE) AS prev_mkt_dmnd_unit,
+CAST(COALESCE(MAX(cur_ddd_unit), 0) AS DOUBLE) AS cur_ddd_unit,
+CAST(COALESCE(MAX(prev_ddd_unit), 0) AS DOUBLE) AS prev_ddd_unit,
+CAST(COALESCE(MAX(cur_mkt_ddd_unit), 0) AS DOUBLE) AS cur_mkt_ddd_unit,
+CAST(COALESCE(MAX(prev_mkt_ddd_unit), 0) AS DOUBLE) AS prev_mkt_ddd_unit,
+CAST(COALESCE(MAX(cur_sp_unit), 0) AS DOUBLE) AS cur_sp_unit,
+CAST(COALESCE(MAX(prev_sp_unit), 0) AS DOUBLE) AS prev_sp_unit,
+CAST(COALESCE(MAX(cur_sd_unit), 0) AS DOUBLE) AS cur_sd_unit,
+CAST(COALESCE(MAX(prev_sd_unit), 0) AS DOUBLE) AS prev_sd_unit,
+CAST(COALESCE(MAX(cur_unit), 0) AS DOUBLE) AS cur_unit,
+CAST(COALESCE(MAX(prev_unit), 0) AS DOUBLE) AS prev_unit,
+CAST(COALESCE(MAX(cur_sd_vial), 0) AS DOUBLE) AS cur_sd_vial,
+CAST(COALESCE(MAX(prev_sd_vial), 0) AS DOUBLE) AS prev_sd_vial,
+CAST(COALESCE(MAX(cur_wrtr_sd_ct), 0) AS DOUBLE) AS cur_wrtr_sd_ct,
+CAST(COALESCE(MAX(prev_wrtr_sd_ct), 0) AS DOUBLE) AS prev_wrtr_sd_ct,
+CAST(COALESCE(MAX(cur_actv_shp_pat_ct), 0) AS DOUBLE) AS cur_actv_shp_pat_ct,
+CAST(COALESCE(MAX(cur_actv_all_pat_ct), 0) AS DOUBLE) AS cur_actv_all_pat_ct,
+CAST(COALESCE(MAX(cur_new_pat_ct), 0) AS DOUBLE) AS cur_new_pat_ct,
+CAST(COALESCE(MAX(prev_new_pat_ct), 0) AS DOUBLE) AS prev_new_pat_ct,
+CAST(COALESCE(MAX(cur_net_ref_ct), 0) AS DOUBLE) AS cur_net_ref_ct,
+CAST(COALESCE(MAX(prev_net_ref_ct), 0) AS DOUBLE) AS prev_net_ref_ct,
+CAST(COALESCE(MAX(cur_rch_pct), 0) AS DOUBLE) AS cur_rch_pct,
+CAST(COALESCE(MAX(cur_rch_high_pct), 0) AS DOUBLE) AS cur_rch_high_pct,
+CAST(COALESCE(MAX(cur_totl_cpd_ct), 0) AS DOUBLE) AS cur_totl_cpd_ct,
+CAST(COALESCE(MAX(cur_trgt_cpd_ct), 0) AS DOUBLE) AS cur_trgt_cpd_ct,
+CAST(COALESCE(MAX(cur_tdfa_pct), 0) AS DOUBLE) AS cur_tdfa_pct,
+CAST(COALESCE(MAX(cur_tdfa_high_pct), 0) AS DOUBLE) AS cur_tdfa_high_pct,
+CAST(COALESCE(MAX(dscn_ach), 0) AS DOUBLE) AS dscn_ach,
+CAST(COALESCE(MAX(trgt_dscn_ach), 0) AS DOUBLE) AS trgt_dscn_ach,
+CAST(COALESCE(MAX(dscn_asgn), 0) AS DOUBLE) AS dscn_asgn,
+CAST(COALESCE(MAX(p1_dscn_ach), 0) AS DOUBLE) AS p1_dscn_ach,
+CAST(COALESCE(MAX(p2_dscn_ach), 0) AS DOUBLE) AS p2_dscn_ach,
+CAST(COALESCE(MAX(p1_dscn_asgn), 0) AS DOUBLE) AS p1_dscn_asgn,
+CAST(COALESCE(MAX(p2_dscn_asgn), 0) AS DOUBLE) AS p2_dscn_asgn,
+MAX(src_load_dt) AS src_load_dt
+FROM temp_acty_dscn_call_geo_sls_df
+GROUP BY
+tb_id,
+tb_cd, 
+geo_id, 
+geo_ds, 
+team_id, 
+team_nm,
+az_mkt_id, 
+mkt_nm, 
+brd_fam_id, 
+brd_fam_ds,
+seg_type, 
+seg_val_id
+""")
+temp_acty_dscn_call_geo_sls_df_aggr.createOrReplaceTempView('temp_acty_dscn_call_geo_sls_df_aggr')
+# Step 19: Merge Final Dataframes of above Data Sources
+temp_merge_df = temp_xpopd_sls_final_df.unionAll(temp_trlst_geo_sls_df).unionAll(temp_claim_pat_sls_df).unionAll(temp_ddd_sls_final_df).unionAll(temp_spsd_geo_sls_df).unionAll(temp_acty_dscn_call_geo_sls_df_aggr)
+temp_merge_df.createOrReplaceTempView('temp_merge_df')
+temp_merge_df.persist(StorageLevel.MEMORY_AND_DISK)
+tb_id_min = spark.sql("""
+select 
+tb_cd ,
+min(tb_id ) as tb_id 
+from 
+temp_merge_df
+group by
+tb_cd
+""")
+tb_id_min.createOrReplaceTempView('tb_id_min')
+temp_tb_id_merge = spark.sql(f"""
+select
+tb.tb_id,
+sls.tb_cd,
+sls.geo_id geo_id,
+sls.geo_ds geo_ds,
+sls.team_id,
+sls.team_nm,
+sls.az_mkt_id,
+sls.mkt_nm,
+sls.brd_fam_id,
+sls.brd_fam_ds,
+upper(sls.seg_type) as seg_type,
+sls.seg_val_id,
+CAST(COALESCE(MAX(cur_trx_ct), 0) AS DOUBLE) AS cur_trx_ct,
+CAST(COALESCE(MAX(prev_trx_ct), 0) AS DOUBLE) AS prev_trx_ct,
+CAST(COALESCE(MAX(cur_mkt_trx_ct), 0) AS DOUBLE) AS cur_mkt_trx_ct,
+CAST(COALESCE(MAX(prev_mkt_trx_ct), 0) AS DOUBLE) AS prev_mkt_trx_ct,
+CAST(COALESCE(MAX(cur_nrx_ct), 0) AS DOUBLE) AS cur_nrx_ct,
+CAST(COALESCE(MAX(prev_nrx_ct), 0) AS DOUBLE) AS prev_nrx_ct,
+CAST(COALESCE(MAX(cur_mkt_nrx_ct), 0) AS DOUBLE) AS cur_mkt_nrx_ct,
+CAST(COALESCE(MAX(prev_mkt_nrx_ct), 0) AS DOUBLE) AS prev_mkt_nrx_ct,
+CAST(COALESCE(MAX(cur_nbrx_ct), 0) AS DOUBLE) AS cur_nbrx_ct,
+CAST(COALESCE(MAX(prev_nbrx_ct), 0) AS DOUBLE) AS prev_nbrx_ct,
+CAST(COALESCE(MAX(cur_mkt_nbrx_ct), 0) AS DOUBLE) AS cur_mkt_nbrx_ct,
+CAST(COALESCE(MAX(prev_mkt_nbrx_ct), 0) AS DOUBLE) AS prev_mkt_nbrx_ct,
+CAST(COALESCE(MAX(cur_uvrs_ct), 0) AS DOUBLE) AS cur_uvrs_ct,
+CAST(COALESCE(MAX(cur_trlst_ct), 0) AS DOUBLE) AS cur_trlst_ct,
+CAST(COALESCE(MAX(prev_trlst_ct), 0) AS DOUBLE) AS prev_trlst_ct,
+CAST(COALESCE(MAX(cur_rptr_ct), 0) AS DOUBLE) AS cur_rptr_ct,
+CAST(COALESCE(MAX(prev_rptr_ct), 0) AS DOUBLE) AS prev_rptr_ct,
+CAST(COALESCE(MAX(cur_adpt_ct), 0) AS DOUBLE) AS cur_adpt_ct,
+CAST(COALESCE(MAX(prev_adptr_ct), 0) AS DOUBLE) AS prev_adptr_ct,
+CAST(COALESCE(MAX(totl_adpt_dpth), 0) AS DOUBLE) AS totl_adpt_dpth,
+CAST(COALESCE(MAX(bob_adpt_dpth), 0) AS DOUBLE) AS bob_adpt_dpth,
+CAST(COALESCE(MAX(trgt_adpt_dpth), 0) AS DOUBLE) AS trgt_adpt_dpth,
+CAST(COALESCE(MAX(cur_tot_wrtr), 0) AS DOUBLE) AS cur_tot_wrtr,
+CAST(COALESCE(MAX(prev_tot_wrtr), 0) AS DOUBLE) AS prev_tot_wrtr,
+CAST(COALESCE(MAX(cur_dmnd_unit), 0) AS DOUBLE) AS cur_dmnd_unit,
+CAST(COALESCE(MAX(prev_dmnd_unit), 0) AS DOUBLE) AS prev_dmnd_unit,
+CAST(COALESCE(MAX(cur_mkt_dmnd_unit), 0) AS DOUBLE) AS cur_mkt_dmnd_unit,
+CAST(COALESCE(MAX(prev_mkt_dmnd_unit), 0) AS DOUBLE) AS prev_mkt_dmnd_unit,
+CAST(COALESCE(MAX(cur_ddd_unit), 0) AS DOUBLE) AS cur_ddd_unit,
+CAST(COALESCE(MAX(prev_ddd_unit), 0) AS DOUBLE) AS prev_ddd_unit,
+CAST(COALESCE(MAX(cur_mkt_ddd_unit), 0) AS DOUBLE) AS cur_mkt_ddd_unit,
+CAST(COALESCE(MAX(prev_mkt_ddd_unit), 0) AS DOUBLE) AS prev_mkt_ddd_unit,
+CAST(COALESCE(MAX(cur_sp_unit), 0) AS DOUBLE) AS cur_sp_unit,
+CAST(COALESCE(MAX(prev_sp_unit), 0) AS DOUBLE) AS prev_sp_unit,
+CAST(COALESCE(MAX(cur_sd_unit), 0) AS DOUBLE) AS cur_sd_unit,
+CAST(COALESCE(MAX(prev_sd_unit), 0) AS DOUBLE) AS prev_sd_unit,
+CAST(COALESCE(MAX(cur_unit), 0) AS DOUBLE) AS cur_unit,
+CAST(COALESCE(MAX(prev_unit), 0) AS DOUBLE) AS prev_unit,
+CAST(COALESCE(MAX(cur_sd_vial), 0) AS DOUBLE) AS cur_sd_vial,
+CAST(COALESCE(MAX(prev_sd_vial), 0) AS DOUBLE) AS prev_sd_vial,
+CAST(COALESCE(MAX(cur_wrtr_sd_ct), 0) AS DOUBLE) AS cur_wrtr_sd_ct,
+CAST(COALESCE(MAX(prev_wrtr_sd_ct), 0) AS DOUBLE) AS prev_wrtr_sd_ct,
+CAST(COALESCE(MAX(cur_actv_shp_pat_ct), 0) AS DOUBLE) AS cur_actv_shp_pat_ct,
+CAST(COALESCE(MAX(cur_actv_all_pat_ct), 0) AS DOUBLE) AS cur_actv_all_pat_ct,
+CAST(COALESCE(MAX(cur_new_pat_ct), 0) AS DOUBLE) AS cur_new_pat_ct,
+CAST(COALESCE(MAX(prev_new_pat_ct), 0) AS DOUBLE) AS prev_new_pat_ct,
+CAST(COALESCE(MAX(cur_net_ref_ct), 0) AS DOUBLE) AS cur_net_ref_ct,
+CAST(COALESCE(MAX(prev_net_ref_ct), 0) AS DOUBLE) AS prev_net_ref_ct,
+CAST(COALESCE(MAX(cur_rch_pct), 0) AS DOUBLE) AS cur_rch_pct,
+CAST(COALESCE(MAX(cur_rch_high_pct), 0) AS DOUBLE) AS cur_rch_high_pct,
+CAST(COALESCE(MAX(cur_tdfa_pct), 0) AS DOUBLE) AS cur_tdfa_pct,
+CAST(COALESCE(MAX(cur_tdfa_high_pct), 0) AS DOUBLE) AS cur_tdfa_high_pct,
+CAST(COALESCE(MAX(cur_totl_cpd_ct), 0) AS DOUBLE) AS cur_totl_cpd_ct,
+CAST(COALESCE(MAX(cur_trgt_cpd_ct), 0) AS DOUBLE) AS cur_trgt_cpd_ct,
+CAST(COALESCE(MAX(dscn_ach), 0) AS DOUBLE) AS dscn_ach,
+CAST(COALESCE(MAX(trgt_dscn_ach), 0) AS DOUBLE) AS trgt_dscn_ach,
+CAST(COALESCE(MAX(dscn_asgn), 0) AS DOUBLE) AS dscn_asgn,
+CAST(COALESCE(MAX(p1_dscn_ach), 0) AS DOUBLE) AS p1_dscn_ach,
+CAST(COALESCE(MAX(p1_dscn_asgn), 0) AS DOUBLE) AS p1_dscn_asgn,
+CAST(COALESCE(MAX(p2_dscn_ach), 0) AS DOUBLE) AS p2_dscn_ach,
+CAST(COALESCE(MAX(p2_dscn_asgn), 0) AS DOUBLE) AS p2_dscn_asgn,
+max(sls.src_load_dt) as src_load_dt 
+from 
+temp_merge_df sls        
+join
+tb_id_min tb
+on
+sls.tb_cd = tb.tb_cd  
+GROUP BY
+tb.tb_id,
+sls.tb_cd,
+sls.geo_id,
+sls.geo_ds,
+sls.team_id,
+sls.team_nm,
+sls.az_mkt_id,
+sls.mkt_nm,
+sls.brd_fam_id,
+sls.brd_fam_ds,
+sls.seg_type,
+sls.seg_val_id
+""")
+temp_tb_id_merge.createOrReplaceTempView('temp_tb_id_merge')
+temp_merge_df.unpersist()
+temp_tb_id_merge.persist(StorageLevel.MEMORY_AND_DISK)
+temp_prty_high_df = spark.sql(f"""
+select
+/*+ broadcast(seg) */
+acty.tb_id,
+acty.tb_cd,
+acty.geo_id,
+acty.geo_ds,
+acty.team_id,
+acty.team_nm,
+acty.az_mkt_id,
+acty.mkt_nm,
+acty.brd_fam_id,
+acty.brd_fam_ds,
+acty.cur_rch_pct as cur_rch_high_pct,
+acty.cur_tdfa_pct as cur_tdfa_high_pct
+from
+temp_tb_id_merge acty
+join {from_publish_schema_name}.d_seg seg ON acty.seg_val_id = seg.seg_val_id 
+WHERE UPPER(seg.seg_type) = 'PRIORITY' 
+AND UPPER(seg.seg_val_ds) = 'HIGH'
+""")
+temp_prty_high_df.createOrReplaceTempView('temp_prty_high_df')
+temp_merge_aggr_df = spark.sql(f"""
+select
+/*+ broadcast(epa,tb,cfg) */
+acty.tb_id,
+acty.tb_cd,
+acty.geo_id,
+acty.geo_ds,
+acty.team_id,
+acty.team_nm,
+acty.az_mkt_id,
+acty.mkt_nm,
+acty.brd_fam_id,
+acty.brd_fam_ds,
+acty.seg_type,
+acty.seg_val_id,
+acty.cur_trx_ct,
+acty.prev_trx_ct,
+acty.cur_mkt_trx_ct,
+acty.prev_mkt_trx_ct,
+acty.cur_nrx_ct,
+acty.prev_nrx_ct,
+acty.cur_mkt_nrx_ct,
+acty.prev_mkt_nrx_ct,
+acty.cur_nbrx_ct,
+acty.prev_nbrx_ct,
+acty.cur_mkt_nbrx_ct,
+acty.prev_mkt_nbrx_ct,
+acty.cur_uvrs_ct,
+acty.cur_trlst_ct,
+acty.prev_trlst_ct,
+acty.cur_rptr_ct,
+acty.prev_rptr_ct,
+acty.cur_adpt_ct,
+acty.prev_adptr_ct,
+acty.totl_adpt_dpth,
+acty.bob_adpt_dpth,
+acty.trgt_adpt_dpth,
+acty.cur_tot_wrtr,
+acty.prev_tot_wrtr,
+acty.cur_dmnd_unit,
+acty.prev_dmnd_unit,
+acty.cur_mkt_dmnd_unit,
+acty.prev_mkt_dmnd_unit,
+acty.cur_ddd_unit,
+acty.prev_ddd_unit,
+acty.cur_mkt_ddd_unit,
+acty.prev_mkt_ddd_unit,
+acty.cur_sp_unit,
+acty.prev_sp_unit,
+acty.cur_sd_unit,
+acty.prev_sd_unit,
+acty.cur_unit,
+acty.prev_unit,
+acty.cur_sd_vial,
+acty.prev_sd_vial,
+acty.cur_wrtr_sd_ct,
+acty.prev_wrtr_sd_ct,
+acty.cur_actv_shp_pat_ct,
+acty.cur_actv_all_pat_ct,
+acty.cur_new_pat_ct,
+acty.prev_new_pat_ct,
+acty.cur_net_ref_ct,
+acty.prev_net_ref_ct,
+acty.cur_rch_pct,
+COALESCE(MAX(prty.cur_rch_high_pct) OVER (PARTITION BY acty.tb_id, acty.tb_cd, acty.geo_id, acty.az_mkt_id, acty.brd_fam_id), 0) AS cur_rch_high_pct,
+acty.cur_totl_cpd_ct,
+acty.cur_trgt_cpd_ct,
+acty.cur_tdfa_pct,
+COALESCE(MAX(prty.cur_tdfa_high_pct) OVER (PARTITION BY acty.tb_id, acty.tb_cd, acty.geo_id, acty.az_mkt_id, acty.brd_fam_id), 0) AS cur_tdfa_high_pct,
+acty.dscn_ach,
+acty.trgt_dscn_ach,
+acty.dscn_asgn,
+acty.p1_dscn_ach,
+acty.p2_dscn_ach,
+acty.p1_dscn_asgn,
+acty.p2_dscn_asgn,
+acty.src_load_dt
+from 
+temp_tb_id_merge acty 
+left join temp_prty_high_df prty
+ON acty.geo_id = prty.geo_id 
+AND acty.tb_id = prty.tb_id 
+AND acty.tb_cd = prty.tb_cd 
+AND acty.az_mkt_id = prty.az_mkt_id
+AND acty.brd_fam_id = prty.brd_fam_id
+""")
+temp_merge_aggr_df.createOrReplaceTempView('temp_merge_aggr_df')
+temp_tb_id_merge.unpersist()
+temp_aggr_par_mtrc_df = spark.sql(f"""
+select
+child.tb_id,
+child.tb_cd,
+child.geo_id,
+child.geo_ds,
+child.team_id,
+child.team_nm,
+child.az_mkt_id,
+child.mkt_nm,
+child.brd_fam_id,
+child.brd_fam_ds,
+upper(child.seg_type) as seg_type,
+child.seg_val_id,
+algt.hiery_lvl as hiery_lvl_ds,
+child.cur_trx_ct,
+child.prev_trx_ct,
+child.cur_mkt_trx_ct,
+child.prev_mkt_trx_ct,
+child.cur_nrx_ct,
+child.prev_nrx_ct,
+child.cur_mkt_nrx_ct,
+child.prev_mkt_nrx_ct,
+child.cur_nbrx_ct,
+child.prev_nbrx_ct,
+child.cur_mkt_nbrx_ct,
+child.prev_mkt_nbrx_ct,
+coalesce(parent.cur_trx_ct,0)  as cur_par_trx_ct,
+coalesce(parent.cur_nrx_ct,0) as cur_par_nrx_ct,
+coalesce(parent.cur_nbrx_ct,0) as cur_par_nbrx_ct,
+child.cur_uvrs_ct,
+child.cur_tot_wrtr,
+child.prev_tot_wrtr,
+child.cur_trlst_ct,
+child.prev_trlst_ct,
+child.cur_rptr_ct,
+child.prev_rptr_ct,
+child.cur_adpt_ct,
+child.prev_adptr_ct,
+child.totl_adpt_dpth,
+child.bob_adpt_dpth,
+child.trgt_adpt_dpth,
+child.cur_dmnd_unit,
+child.prev_dmnd_unit,
+child.cur_mkt_dmnd_unit,
+child.prev_mkt_dmnd_unit,
+child.cur_ddd_unit,
+child.prev_ddd_unit,
+child.cur_mkt_ddd_unit,
+child.prev_mkt_ddd_unit,
+coalesce(parent.cur_ddd_unit,0) as cur_par_ddd_unit,        
+child.cur_sp_unit,
+child.prev_sp_unit,
+child.cur_sd_unit,
+child.prev_sd_unit,
+child.cur_unit,
+child.prev_unit,        
+child.cur_sd_vial,
+child.prev_sd_vial,
+child.cur_wrtr_sd_ct,
+child.prev_wrtr_sd_ct,
+child.cur_actv_shp_pat_ct,
+child.cur_actv_all_pat_ct,
+coalesce(parent.cur_sp_unit,0) as cur_par_sp_unit,
+coalesce(parent.cur_sd_unit,0) as cur_par_sd_unit,
+coalesce(parent.cur_unit,0) as cur_par_unit,
+child.cur_new_pat_ct,
+child.prev_new_pat_ct,
+child.cur_net_ref_ct,
+child.prev_net_ref_ct,
+child.cur_rch_pct,
+child.cur_rch_high_pct,
+child.cur_totl_cpd_ct,
+child.cur_trgt_cpd_ct,
+child.cur_tdfa_pct,
+child.cur_tdfa_high_pct,
+child.dscn_ach,
+child.trgt_dscn_ach,
+child.dscn_asgn,
+child.p1_dscn_ach,
+child.p1_dscn_asgn,  
+child.p2_dscn_ach,
+child.p2_dscn_asgn,  
+child.src_load_dt
+from 
+temp_merge_aggr_df child
+left join
+r_geo_funcl_hiery_temp_df hiery
+on
+child.geo_id = hiery.chld_hiery_id
+join
+{from_publish_schema_name}.d_aligt_geo algt
+on child.geo_id = algt.geo_id
+left join
+temp_merge_aggr_df parent
+on
+parent.geo_id = hiery.par_hiery_id 
+and child.tb_id= parent.tb_id
+and child.az_mkt_id= parent.az_mkt_id
+and child.brd_fam_id=parent.brd_fam_id
+and child.team_id = parent.team_id
+and child.seg_val_id=parent.seg_val_id
+group by 
+child.tb_id,
+child.tb_cd,
+child.geo_id,
+child.geo_ds,
+child.team_id,
+child.team_nm,
+child.az_mkt_id,
+child.mkt_nm,
+child.brd_fam_id,
+child.brd_fam_ds,
+child.seg_type,
+child.seg_val_id,
+algt.hiery_lvl,
+child.cur_trx_ct,
+child.prev_trx_ct,
+child.cur_mkt_trx_ct,
+child.prev_mkt_trx_ct,
+child.cur_nrx_ct,
+child.prev_nrx_ct,
+child.cur_mkt_nrx_ct,
+child.prev_mkt_nrx_ct,
+child.cur_nbrx_ct,
+child.prev_nbrx_ct,
+child.cur_mkt_nbrx_ct,
+child.prev_mkt_nbrx_ct,
+parent.cur_trx_ct,
+parent.cur_nrx_ct,
+parent.cur_nbrx_ct,
+child.cur_uvrs_ct,
+child.cur_tot_wrtr,
+child.prev_tot_wrtr,
+child.cur_trlst_ct,
+child.prev_trlst_ct,
+child.cur_rptr_ct,
+child.prev_rptr_ct,
+child.cur_adpt_ct,
+child.prev_adptr_ct,
+child.totl_adpt_dpth,
+child.bob_adpt_dpth,
+child.trgt_adpt_dpth,
+child.cur_dmnd_unit,
+child.prev_dmnd_unit,
+child.cur_mkt_dmnd_unit,
+child.prev_mkt_dmnd_unit,
+child.cur_ddd_unit,
+child.prev_ddd_unit,
+child.cur_mkt_ddd_unit,
+child.prev_mkt_ddd_unit,
+parent.cur_ddd_unit,
+child.cur_sp_unit,
+child.prev_sp_unit,
+child.cur_sd_unit,
+child.prev_sd_unit,
+child.cur_unit,
+child.prev_unit,
+child.cur_sd_vial,
+child.prev_sd_vial,
+child.cur_wrtr_sd_ct,
+child.prev_wrtr_sd_ct,
+child.cur_actv_shp_pat_ct,
+child.cur_actv_all_pat_ct,
+parent.cur_sp_unit,
+parent.cur_sd_unit,
+parent.cur_unit,
+child.cur_new_pat_ct,
+child.prev_new_pat_ct,
+child.cur_net_ref_ct,
+child.prev_net_ref_ct,
+child.cur_rch_pct,
+child.cur_rch_high_pct,
+child.cur_totl_cpd_ct,
+child.cur_trgt_cpd_ct,
+child.cur_tdfa_pct,
+child.cur_tdfa_high_pct,
+child.dscn_ach,
+child.trgt_dscn_ach,
+child.dscn_asgn,
+child.p1_dscn_ach,
+child.p1_dscn_asgn,
+child.p2_dscn_ach,
+child.p2_dscn_asgn,
+child.src_load_dt
+""")
+temp_aggr_par_mtrc_df.createOrReplaceTempView('temp_aggr_par_mtrc_df')
+temp_natl_mtrc_df = spark.sql(f"""
+select
+sls.tb_id,
+sls.tb_cd,
+sls.geo_id,
+sls.geo_ds,
+sls.team_id,
+sls.team_nm,
+sls.az_mkt_id,
+sls.mkt_nm,
+sls.brd_fam_id,
+sls.brd_fam_ds,
+upper(sls.seg_type) as seg_type,
+sls.seg_val_id,
+sls.cur_trx_ct,
+sls.prev_trx_ct,
+sls.cur_mkt_trx_ct,
+sls.prev_mkt_trx_ct,
+sls.cur_nrx_ct,
+sls.prev_nrx_ct,
+sls.cur_mkt_nrx_ct,
+sls.prev_mkt_nrx_ct,
+sls.cur_nbrx_ct,
+sls.prev_nbrx_ct,
+sls.cur_mkt_nbrx_ct,
+sls.prev_mkt_nbrx_ct,
+coalesce(aggr.cur_trx_ct      ,0) as cur_natl_trx_ct      ,
+coalesce(aggr.prev_trx_ct     ,0) as prev_natl_trx_ct     ,
+coalesce(aggr.cur_mkt_trx_ct  ,0) as cur_natl_mkt_trx_ct  ,
+coalesce(aggr.prev_mkt_trx_ct ,0) as prev_natl_mkt_trx_ct ,
+coalesce(aggr.cur_nrx_ct      ,0) as cur_natl_nrx_ct      ,
+coalesce(aggr.prev_nrx_ct     ,0) as prev_natl_nrx_ct     ,
+coalesce(aggr.cur_mkt_nrx_ct  ,0) as cur_natl_mkt_nrx_ct  ,
+coalesce(aggr.prev_mkt_nrx_ct ,0) as prev_natl_mkt_nrx_ct ,
+coalesce(aggr.cur_nbrx_ct     ,0) as cur_natl_nbrx_ct     ,
+coalesce(aggr.prev_nbrx_ct    ,0) as prev_natl_nbrx_ct    ,
+coalesce(aggr.cur_mkt_nbrx_ct ,0) as cur_natl_mkt_nbrx_ct ,
+coalesce(aggr.prev_mkt_nbrx_ct,0) as prev_natl_mkt_nbrx_ct,
+sls.cur_par_trx_ct,
+sls.cur_par_nrx_ct,
+sls.cur_par_nbrx_ct,
+sls.cur_uvrs_ct,
+sls.cur_tot_wrtr,
+sls.prev_tot_wrtr,
+sls.cur_trlst_ct,
+sls.prev_trlst_ct,
+sls.cur_rptr_ct,
+sls.prev_rptr_ct,
+sls.cur_adpt_ct,
+sls.prev_adptr_ct,
+sls.totl_adpt_dpth,
+sls.bob_adpt_dpth,
+sls.trgt_adpt_dpth,
+sls.cur_dmnd_unit,
+sls.prev_dmnd_unit,
+sls.cur_mkt_dmnd_unit,
+sls.prev_mkt_dmnd_unit,
+sls.cur_ddd_unit,
+sls.prev_ddd_unit,
+sls.cur_mkt_ddd_unit,
+sls.prev_mkt_ddd_unit,
+sls.cur_par_ddd_unit,
+coalesce(aggr.cur_ddd_unit,0) as cur_natl_ddd_unit,
+coalesce(aggr.cur_mkt_ddd_unit,0) as cur_natl_mkt_ddd_unit,
+sls.cur_sp_unit,
+sls.prev_sp_unit,
+sls.cur_sd_unit,
+sls.prev_sd_unit,
+sls.cur_unit,
+sls.prev_unit,
+sls.cur_sd_vial,
+sls.prev_sd_vial,
+sls.cur_wrtr_sd_ct,
+sls.prev_wrtr_sd_ct,
+sls.cur_actv_shp_pat_ct,
+sls.cur_actv_all_pat_ct,
+sls.cur_par_sp_unit,
+sls.cur_par_sd_unit,
+sls.cur_par_unit,
+coalesce(aggr.cur_sp_unit,0) as cur_natl_sp_unit,
+coalesce(aggr.cur_sd_unit,0) as cur_natl_sd_unit,
+coalesce(aggr.cur_unit,0) as cur_natl_unit,
+coalesce(aggr.cur_actv_shp_pat_ct,0) as cur_natl_actv_shp_pat_ct,
+coalesce(aggr.cur_actv_all_pat_ct,0) as cur_natl_actv_all_pat_ct,
+sls.cur_new_pat_ct,
+sls.prev_new_pat_ct,
+sls.cur_net_ref_ct,
+coalesce(aggr.cur_net_ref_ct,0) as cur_natl_net_ref_ct,
+sls.prev_net_ref_ct,
+sls.cur_rch_pct,
+sls.cur_rch_high_pct,
+sls.cur_totl_cpd_ct,
+sls.cur_trgt_cpd_ct,
+sls.cur_tdfa_pct,
+sls.cur_tdfa_high_pct,
+sls.dscn_ach,
+sls.trgt_dscn_ach,
+sls.dscn_asgn,
+sls.p1_dscn_ach,
+sls.p1_dscn_asgn,
+sls.p2_dscn_ach,
+sls.p2_dscn_asgn,
+sls.src_load_dt
+from
+temp_aggr_par_mtrc_df sls
+left join
+temp_aggr_par_mtrc_df aggr
+on 
+aggr.hiery_lvl_ds = 'NAT'
+and sls.tb_id = aggr.tb_id
+and sls.team_nm = aggr.team_nm
+and sls.mkt_nm = aggr.mkt_nm
+and sls.brd_fam_id = aggr.brd_fam_id
+and sls.seg_val_id=aggr.seg_val_id
+""")
+temp_natl_mtrc_df.createOrReplaceTempView('temp_natl_mtrc_df')
+temp_natl_mtrc_df.persist(StorageLevel.MEMORY_AND_DISK)
+cfg_trlst_parm_tbl_df.unpersist()
+tm_mkt_prd_df.unpersist()
+spark.sql(f"""
+INSERT OVERWRITE TABLE {to_datalake_schema_name}.{to_table_name} partition(data_dt,cycl_id)
+select
+CAST(sls.tb_id AS bigint) AS tb_id,
+CAST(sls.tb_cd AS string) AS tb_cd,
+CAST(sls.geo_id AS bigint) AS geo_id,
+CAST(sls.geo_ds AS string) AS geo_ds,
+CAST(sls.team_id AS bigint) AS team_id,
+CAST(sls.team_nm AS string) AS team_nm,
+CAST(sls.az_mkt_id AS bigint) AS az_mkt_id,
+CAST(sls.mkt_nm AS string) AS mkt_nm,
+CAST(sls.brd_fam_id AS string) AS brd_fam_id,
+CAST(sls.brd_fam_ds AS string) AS brd_fam_ds,
+CAST(sls.seg_type AS string) AS seg_type,
+CAST(sls.seg_val_id AS string) AS seg_val_id,
+ROUND(CAST(sls.cur_trx_ct AS double), 3) AS cur_trx_ct,
+ROUND(CAST(sls.prev_trx_ct AS double), 3) AS prev_trx_ct,
+ROUND(CAST(sls.cur_mkt_trx_ct AS double), 3) AS cur_mkt_trx_ct,
+ROUND(CAST(sls.prev_mkt_trx_ct AS double), 3) AS prev_mkt_trx_ct,
+ROUND(CAST(sls.cur_nrx_ct AS double), 3) AS cur_nrx_ct,
+ROUND(CAST(sls.prev_nrx_ct AS double), 3) AS prev_nrx_ct,
+ROUND(CAST(sls.cur_mkt_nrx_ct AS double), 3) AS cur_mkt_nrx_ct,
+ROUND(CAST(sls.prev_mkt_nrx_ct AS double), 3) AS prev_mkt_nrx_ct,
+ROUND(CAST(sls.cur_nbrx_ct AS double), 3) AS cur_nbrx_ct,
+ROUND(CAST(sls.prev_nbrx_ct AS double), 3) AS prev_nbrx_ct,
+ROUND(CAST(sls.cur_mkt_nbrx_ct AS double), 3) AS cur_mkt_nbrx_ct,
+ROUND(CAST(sls.prev_mkt_nbrx_ct AS double), 3) AS prev_mkt_nbrx_ct,
+ROUND(CAST(sls.cur_natl_trx_ct AS double), 3) AS cur_natl_trx_ct,
+ROUND(CAST(sls.prev_natl_trx_ct AS double), 3) AS prev_natl_trx_ct,
+ROUND(CAST(sls.cur_natl_mkt_trx_ct AS double), 3) AS cur_natl_mkt_trx_ct,
+ROUND(CAST(sls.prev_natl_mkt_trx_ct AS double), 3) AS prev_natl_mkt_trx_ct,
+ROUND(CAST(sls.cur_natl_nrx_ct AS double), 3) AS cur_natl_nrx_ct,
+ROUND(CAST(sls.prev_natl_nrx_ct AS double), 3) AS prev_natl_nrx_ct,
+ROUND(CAST(sls.cur_natl_mkt_nrx_ct AS double), 3) AS cur_natl_mkt_nrx_ct,
+ROUND(CAST(sls.prev_natl_mkt_nrx_ct AS double), 3) AS prev_natl_mkt_nrx_ct,
+ROUND(CAST(sls.cur_natl_nbrx_ct AS double), 3) AS cur_natl_nbrx_ct,
+ROUND(CAST(sls.prev_natl_nbrx_ct AS double), 3) AS prev_natl_nbrx_ct,
+ROUND(CAST(sls.cur_natl_mkt_nbrx_ct AS double), 3) AS cur_natl_mkt_nbrx_ct,
+ROUND(CAST(sls.prev_natl_mkt_nbrx_ct AS double), 3) AS prev_natl_mkt_nbrx_ct,
+ROUND(CAST(sls.cur_par_trx_ct AS double), 3) AS cur_par_trx_ct,
+ROUND(CAST(sls.cur_par_nrx_ct AS double), 3) AS cur_par_nrx_ct,
+ROUND(CAST(sls.cur_par_nbrx_ct AS double), 3) AS cur_par_nbrx_ct,
+ROUND(CAST(sls.cur_uvrs_ct AS double), 3) AS cur_uvrs_ct,
+ROUND(CAST(sls.cur_tot_wrtr AS double), 3) AS cur_tot_wrtr,
+ROUND(CAST(sls.prev_tot_wrtr AS double), 3) AS prev_tot_wrtr,
+ROUND(CAST(sls.cur_trlst_ct AS double), 3) AS cur_trlst_ct,
+ROUND(CAST(sls.prev_trlst_ct AS double), 3) AS prev_trlst_ct,
+ROUND(CAST(sls.cur_rptr_ct AS double), 3) AS cur_rptr_ct,
+ROUND(CAST(sls.prev_rptr_ct AS double), 3) AS prev_rptr_ct,
+ROUND(CAST(sls.cur_adpt_ct AS double), 3) AS cur_adpt_ct,
+ROUND(CAST(sls.prev_adptr_ct AS double), 3) AS prev_adptr_ct,
+ROUND(CAST(sls.totl_adpt_dpth AS double), 3) AS totl_adpt_dpth,
+ROUND(CAST(sls.bob_adpt_dpth AS double), 3) AS bob_adpt_dpth,
+ROUND(CAST(sls.trgt_adpt_dpth AS double), 3) AS trgt_adpt_dpth,
+ROUND(CAST(sls.cur_dmnd_unit AS double), 3) AS cur_dmnd_unit,
+ROUND(CAST(sls.prev_dmnd_unit AS double), 3) AS prev_dmnd_unit,
+ROUND(CAST(sls.cur_mkt_dmnd_unit AS double), 3) AS cur_mkt_dmnd_unit,
+ROUND(CAST(sls.prev_mkt_dmnd_unit AS double), 3) AS prev_mkt_dmnd_unit,
+ROUND(CAST(sls.cur_ddd_unit AS double), 3) AS cur_ddd_unit,
+ROUND(CAST(sls.prev_ddd_unit AS double), 3) AS prev_ddd_unit,
+ROUND(CAST(sls.cur_mkt_ddd_unit AS double), 3) AS cur_mkt_ddd_unit,
+ROUND(CAST(sls.prev_mkt_ddd_unit AS double), 3) AS prev_mkt_ddd_unit,
+ROUND(CAST(sls.cur_par_ddd_unit AS double), 3) AS cur_par_ddd_unit,
+ROUND(CAST(sls.cur_natl_ddd_unit AS double), 3) AS cur_natl_ddd_unit,
+ROUND(CAST(sls.cur_natl_mkt_ddd_unit AS double), 3) AS cur_natl_mkt_ddd_unit,
+ROUND(CAST(sls.cur_sp_unit AS double), 3) AS cur_sp_unit,
+ROUND(CAST(sls.prev_sp_unit AS double), 3) AS prev_sp_unit,
+ROUND(CAST(sls.cur_sd_unit AS double), 3) AS cur_sd_unit,
+ROUND(CAST(sls.prev_sd_unit AS double), 3) AS prev_sd_unit,
+ROUND(CAST(sls.cur_unit AS double), 3) AS cur_unit,
+ROUND(CAST(sls.prev_unit AS double), 3) AS prev_unit,
+ROUND(CAST(sls.cur_sd_vial AS double), 3) AS cur_sd_vial,
+ROUND(CAST(sls.prev_sd_vial AS double), 3) AS prev_sd_vial,
+ROUND(CAST(sls.cur_wrtr_sd_ct AS double), 3) AS cur_wrtr_sd_ct,
+ROUND(CAST(sls.prev_wrtr_sd_ct AS double), 3) AS prev_wrtr_sd_ct,
+ROUND(CAST(sls.cur_actv_shp_pat_ct AS double), 3) AS cur_actv_shp_pat_ct,
+ROUND(CAST(sls.cur_actv_all_pat_ct AS double), 3) AS cur_actv_all_pat_ct,
+ROUND(CAST(sls.cur_par_sp_unit AS double), 3) AS cur_par_sp_unit,
+ROUND(CAST(sls.cur_par_sd_unit AS double), 3) AS cur_par_sd_unit,
+ROUND(CAST(sls.cur_par_unit AS double), 3) AS cur_par_unit,
+ROUND(CAST(sls.cur_natl_sp_unit AS double), 3) AS cur_natl_sp_unit,
+ROUND(CAST(sls.cur_natl_sd_unit AS double), 3) AS cur_natl_sd_unit,
+ROUND(CAST(sls.cur_natl_unit AS double), 3) AS cur_natl_unit,
+ROUND(CAST(sls.cur_natl_actv_shp_pat_ct AS double), 3) AS cur_natl_actv_shp_pat_ct,
+ROUND(CAST(sls.cur_natl_actv_all_pat_ct AS double), 3) AS cur_natl_actv_all_pat_ct,
+ROUND(CAST(sls.cur_new_pat_ct AS double), 3) AS cur_new_pat_ct,
+ROUND(CAST(sls.prev_new_pat_ct AS double), 3) AS prev_new_pat_ct,
+ROUND(CAST(sls.cur_net_ref_ct AS double), 3) AS cur_net_ref_ct,
+ROUND(CAST(sls.prev_net_ref_ct AS double), 3) AS prev_net_ref_ct,
+ROUND(CAST(sls.cur_natl_net_ref_ct AS double), 3) AS cur_natl_net_ref_ct,
+ROUND(CAST(sls.cur_rch_pct AS double), 3) AS cur_rch_pct,
+ROUND(CAST(sls.cur_rch_high_pct AS double), 3) AS cur_rch_high_pct,
+ROUND(CAST(sls.cur_totl_cpd_ct AS double), 3) AS cur_totl_cpd_ct,
+ROUND(CAST(sls.cur_trgt_cpd_ct AS double), 3) AS cur_trgt_cpd_ct,
+ROUND(CAST(sls.cur_tdfa_pct AS double), 3) AS cur_tdfa_pct,
+ROUND(CAST(sls.cur_tdfa_high_pct AS double), 3) AS cur_tdfa_high_pct,
+ROUND(CAST(sls.dscn_ach AS double), 3) AS dscn_ach,
+ROUND(CAST(sls.trgt_dscn_ach AS double), 3) AS trgt_dscn_ach,
+ROUND(CAST(sls.dscn_asgn AS double), 3) AS dscn_asgn,
+ROUND(CAST(sls.p1_dscn_ach AS double), 3) AS p1_dscn_ach,
+ROUND(CAST(sls.p1_dscn_asgn AS double), 3) AS p1_dscn_asgn,
+ROUND(CAST(sls.p2_dscn_ach AS double), 3) AS p2_dscn_ach,
+ROUND(CAST(sls.p2_dscn_asgn AS double), 3) AS p2_dscn_asgn,
+CAST(sls.src_load_dt AS string) AS src_load_dt,
+cast({data_dt} as string) data_dt,
+cast({cycl_id} as string) cycl_id
+from
+temp_natl_mtrc_df sls
+""")
+spark.sql(f"""
+INSERT OVERWRITE TABLE {to_publish_schema_name}.{to_table_name}
+select
+tb_id,  
+geo_id,   
+team_id,   
+az_mkt_id,  
+brd_fam_id,  
+seg_type,
+seg_val_id,  
+cur_trx_ct,  
+prev_trx_ct,  
+cur_mkt_trx_ct,  
+prev_mkt_trx_ct,  
+cur_nrx_ct,  
+prev_nrx_ct,  
+cur_mkt_nrx_ct,  
+prev_mkt_nrx_ct,  
+cur_nbrx_ct,  
+prev_nbrx_ct,  
+cur_mkt_nbrx_ct,  
+prev_mkt_nbrx_ct,  
+cur_natl_trx_ct,  
+prev_natl_trx_ct,  
+cur_natl_mkt_trx_ct,  
+prev_natl_mkt_trx_ct,  
+cur_natl_nrx_ct,  
+prev_natl_nrx_ct,  
+cur_natl_mkt_nrx_ct,  
+prev_natl_mkt_nrx_ct,  
+cur_natl_nbrx_ct,  
+prev_natl_nbrx_ct,  
+cur_natl_mkt_nbrx_ct,  
+prev_natl_mkt_nbrx_ct,  
+cur_par_trx_ct,  
+cur_par_nrx_ct,  
+cur_par_nbrx_ct,  
+cur_uvrs_ct,  
+cur_tot_wrtr,  
+prev_tot_wrtr,  
+cur_trlst_ct,  
+prev_trlst_ct,  
+cur_rptr_ct,  
+prev_rptr_ct,  
+cur_adpt_ct,  
+prev_adptr_ct,  
+totl_adpt_dpth,
+bob_adpt_dpth,
+trgt_adpt_dpth,  
+cur_dmnd_unit,  
+prev_dmnd_unit,  
+cur_mkt_dmnd_unit,  
+prev_mkt_dmnd_unit,  
+cur_ddd_unit,  
+prev_ddd_unit,  
+cur_mkt_ddd_unit,  
+prev_mkt_ddd_unit,  
+cur_par_ddd_unit,  
+cur_natl_ddd_unit,  
+cur_natl_mkt_ddd_unit,  
+cur_sp_unit,  
+prev_sp_unit,  
+cur_sd_unit,  
+prev_sd_unit,  
+cur_unit,  
+prev_unit,  
+cur_sd_vial,  
+prev_sd_vial,  
+cur_wrtr_sd_ct,  
+prev_wrtr_sd_ct,  
+cur_actv_shp_pat_ct,  
+cur_actv_all_pat_ct,  
+cur_par_sp_unit,  
+cur_par_sd_unit,  
+cur_par_unit,  
+cur_natl_sp_unit,  
+cur_natl_sd_unit,  
+cur_natl_unit,  
+cur_natl_actv_shp_pat_ct,  
+cur_natl_actv_all_pat_ct,
+cur_new_pat_ct,
+prev_new_pat_ct,
+cur_net_ref_ct,
+prev_net_ref_ct,
+cur_natl_net_ref_ct,
+cur_rch_pct,
+cur_rch_high_pct,
+cur_totl_cpd_ct,  
+cur_trgt_cpd_ct,  
+cur_tdfa_pct,
+cur_tdfa_high_pct,
+dscn_ach,  
+trgt_dscn_ach,  
+dscn_asgn,  
+p1_dscn_ach,  
+p1_dscn_asgn,  
+p2_dscn_ach,  
+p2_dscn_asgn,
+src_load_dt,
+data_dt,  
+cycl_id
+from 
+{to_datalake_schema_name}.{to_table_name}
+where 
+cycl_id = '{cycl_id}'
+""")
+temp_natl_seg_excld_mtrc_df = spark.sql("""
+SELECT
+tb_id,
+tb_cd,
+geo_id,
+geo_ds,
+team_id,
+team_nm,
+az_mkt_id,
+mkt_nm,
+brd_fam_id,
+brd_fam_ds,
+cur_trx_ct,
+prev_trx_ct,
+cur_mkt_trx_ct,
+prev_mkt_trx_ct,
+cur_nrx_ct,
+prev_nrx_ct,
+cur_mkt_nrx_ct,
+prev_mkt_nrx_ct,
+cur_nbrx_ct,
+prev_nbrx_ct,
+cur_mkt_nbrx_ct,
+prev_mkt_nbrx_ct,
+cur_natl_trx_ct,
+prev_natl_trx_ct,
+cur_natl_mkt_trx_ct,
+prev_natl_mkt_trx_ct,
+cur_natl_nrx_ct,
+prev_natl_nrx_ct,
+cur_natl_mkt_nrx_ct,
+prev_natl_mkt_nrx_ct,
+cur_natl_nbrx_ct,
+prev_natl_nbrx_ct,
+cur_natl_mkt_nbrx_ct,
+prev_natl_mkt_nbrx_ct,
+cur_par_trx_ct,
+cur_par_nrx_ct,
+cur_par_nbrx_ct,
+cur_uvrs_ct,
+cur_tot_wrtr,
+prev_tot_wrtr,
+cur_trlst_ct,
+prev_trlst_ct,
+cur_rptr_ct,
+prev_rptr_ct,
+cur_adpt_ct,
+prev_adptr_ct,
+cur_dmnd_unit,
+prev_dmnd_unit,
+cur_mkt_dmnd_unit,
+prev_mkt_dmnd_unit,
+cur_ddd_unit,
+prev_ddd_unit,
+cur_mkt_ddd_unit,
+prev_mkt_ddd_unit,
+cur_par_ddd_unit,
+cur_natl_ddd_unit,
+cur_natl_mkt_ddd_unit,
+cur_sp_unit,
+prev_sp_unit,
+cur_sd_unit,
+prev_sd_unit,
+cur_unit,
+prev_unit,
+cur_sd_vial,
+prev_sd_vial,
+cur_wrtr_sd_ct,
+prev_wrtr_sd_ct,
+cur_actv_shp_pat_ct,
+cur_actv_all_pat_ct,
+cur_par_sp_unit,
+cur_par_sd_unit,
+cur_par_unit,
+cur_natl_sp_unit,
+cur_natl_sd_unit,
+cur_natl_unit,
+cur_natl_actv_shp_pat_ct,
+cur_natl_actv_all_pat_ct,
+cur_net_ref_ct,
+cur_natl_net_ref_ct,
+prev_net_ref_ct,
+cur_rch_pct,
+cur_totl_cpd_ct,
+cur_trgt_cpd_ct,
+cur_tdfa_pct,
+src_load_dt
+FROM temp_natl_mtrc_df
+join
+cfg_gner_parm_val_df cfg
+on
+lower(cfg.tbl_nm) = 'f_mat_geo_smry'
+and lower(cfg.parm_type) = 'segn_excld'
+and upper(cfg.attr1) = upper(mkt_nm)
+and upper(cfg.val) = upper(team_nm)
+and upper(cfg.attr2) = upper(seg_type) 
+""")
+temp_natl_seg_excld_mtrc_df.createOrReplaceTempView("temp_natl_seg_excld_mtrc_df")
+cfg_gner_parm_val_df.unpersist()
+temp_natl_mtrc_df.unpersist()
+spark.sql(f"""
+INSERT OVERWRITE TABLE {to_datalake_schema_name}.{to_spark_table_name} partition(data_dt,cycl_id)
+select
+CAST(sls.tb_id AS bigint) AS tb_id,
+CAST(sls.tb_cd AS string) AS tb_cd,
+CAST(sls.geo_id AS bigint) AS geo_id,
+CAST(sls.geo_ds AS string) AS geo_ds,
+CAST(sls.team_id AS bigint) AS team_id,
+CAST(sls.team_nm AS string) AS team_nm,
+CAST(sls.az_mkt_id AS bigint) AS az_mkt_id,
+CAST(sls.mkt_nm AS string) AS mkt_nm,
+CAST(sls.brd_fam_id AS string) AS brd_fam_id,
+CAST(sls.brd_fam_ds AS string) AS brd_fam_ds,
+ROUND(CAST(sls.cur_trx_ct AS double), 3) AS cur_trx_ct,
+ROUND(CAST(sls.prev_trx_ct AS double), 3) AS prev_trx_ct,
+ROUND(CAST(sls.cur_mkt_trx_ct AS double), 3) AS cur_mkt_trx_ct,
+ROUND(CAST(sls.prev_mkt_trx_ct AS double), 3) AS prev_mkt_trx_ct,
+ROUND(CAST(sls.cur_nrx_ct AS double), 3) AS cur_nrx_ct,
+ROUND(CAST(sls.prev_nrx_ct AS double), 3) AS prev_nrx_ct,
+ROUND(CAST(sls.cur_mkt_nrx_ct AS double), 3) AS cur_mkt_nrx_ct,
+ROUND(CAST(sls.prev_mkt_nrx_ct AS double), 3) AS prev_mkt_nrx_ct,
+ROUND(CAST(sls.cur_nbrx_ct AS double), 3) AS cur_nbrx_ct,
+ROUND(CAST(sls.prev_nbrx_ct AS double), 3) AS prev_nbrx_ct,
+ROUND(CAST(sls.cur_mkt_nbrx_ct AS double), 3) AS cur_mkt_nbrx_ct,
+ROUND(CAST(sls.prev_mkt_nbrx_ct AS double), 3) AS prev_mkt_nbrx_ct,
+ROUND(CAST(sls.cur_natl_trx_ct AS double), 3) AS cur_natl_trx_ct,
+ROUND(CAST(sls.prev_natl_trx_ct AS double), 3) AS prev_natl_trx_ct,
+ROUND(CAST(sls.cur_natl_mkt_trx_ct AS double), 3) AS cur_natl_mkt_trx_ct,
+ROUND(CAST(sls.prev_natl_mkt_trx_ct AS double), 3) AS prev_natl_mkt_trx_ct,
+ROUND(CAST(sls.cur_natl_nrx_ct AS double), 3) AS cur_natl_nrx_ct,
+ROUND(CAST(sls.prev_natl_nrx_ct AS double), 3) AS prev_natl_nrx_ct,
+ROUND(CAST(sls.cur_natl_mkt_nrx_ct AS double), 3) AS cur_natl_mkt_nrx_ct,
+ROUND(CAST(sls.prev_natl_mkt_nrx_ct AS double), 3) AS prev_natl_mkt_nrx_ct,
+ROUND(CAST(sls.cur_natl_nbrx_ct AS double), 3) AS cur_natl_nbrx_ct,
+ROUND(CAST(sls.prev_natl_nbrx_ct AS double), 3) AS prev_natl_nbrx_ct,
+ROUND(CAST(sls.cur_natl_mkt_nbrx_ct AS double), 3) AS cur_natl_mkt_nbrx_ct,
+ROUND(CAST(sls.prev_natl_mkt_nbrx_ct AS double), 3) AS prev_natl_mkt_nbrx_ct,
+ROUND(CAST(sls.cur_par_trx_ct AS double), 3) AS cur_par_trx_ct,
+ROUND(CAST(sls.cur_par_nrx_ct AS double), 3) AS cur_par_nrx_ct,
+ROUND(CAST(sls.cur_par_nbrx_ct AS double), 3) AS cur_par_nbrx_ct,
+ROUND(CAST(sls.cur_uvrs_ct AS double), 3) AS cur_uvrs_ct,
+ROUND(CAST(sls.cur_tot_wrtr AS double), 3) AS cur_tot_wrtr,
+ROUND(CAST(sls.prev_tot_wrtr AS double), 3) AS prev_tot_wrtr,
+ROUND(CAST(sls.cur_trlst_ct AS double), 3) AS cur_trlst_ct,
+ROUND(CAST(sls.prev_trlst_ct AS double), 3) AS prev_trlst_ct,
+ROUND(CAST(sls.cur_rptr_ct AS double), 3) AS cur_rptr_ct,
+ROUND(CAST(sls.prev_rptr_ct AS double), 3) AS prev_rptr_ct,
+ROUND(CAST(sls.cur_adpt_ct AS double), 3) AS cur_adpt_ct,
+ROUND(CAST(sls.prev_adptr_ct AS double), 3) AS prev_adptr_ct,
+ROUND(CAST(sls.cur_dmnd_unit AS double), 3) AS cur_dmnd_unit,
+ROUND(CAST(sls.prev_dmnd_unit AS double), 3) AS prev_dmnd_unit,
+ROUND(CAST(sls.cur_mkt_dmnd_unit AS double), 3) AS cur_mkt_dmnd_unit,
+ROUND(CAST(sls.prev_mkt_dmnd_unit AS double), 3) AS prev_mkt_dmnd_unit,
+ROUND(CAST(sls.cur_ddd_unit AS double), 3) AS cur_ddd_unit,
+ROUND(CAST(sls.prev_ddd_unit AS double), 3) AS prev_ddd_unit,
+ROUND(CAST(sls.cur_mkt_ddd_unit AS double), 3) AS cur_mkt_ddd_unit,
+ROUND(CAST(sls.prev_mkt_ddd_unit AS double), 3) AS prev_mkt_ddd_unit,
+ROUND(CAST(sls.cur_par_ddd_unit AS double), 3) AS cur_par_ddd_unit,
+ROUND(CAST(sls.cur_natl_ddd_unit AS double), 3) AS cur_natl_ddd_unit,
+ROUND(CAST(sls.cur_natl_mkt_ddd_unit AS double), 3) AS cur_natl_mkt_ddd_unit,
+ROUND(CAST(sls.cur_sp_unit AS double), 3) AS cur_sp_unit,
+ROUND(CAST(sls.prev_sp_unit AS double), 3) AS prev_sp_unit,
+ROUND(CAST(sls.cur_sd_unit AS double), 3) AS cur_sd_unit,
+ROUND(CAST(sls.prev_sd_unit AS double), 3) AS prev_sd_unit,
+ROUND(CAST(sls.cur_unit AS double), 3) AS cur_unit,
+ROUND(CAST(sls.prev_unit AS double), 3) AS prev_unit,
+ROUND(CAST(sls.cur_sd_vial AS double), 3) AS cur_sd_vial,
+ROUND(CAST(sls.prev_sd_vial AS double), 3) AS prev_sd_vial,
+ROUND(CAST(sls.cur_wrtr_sd_ct AS double), 3) AS cur_wrtr_sd_ct,
+ROUND(CAST(sls.prev_wrtr_sd_ct AS double), 3) AS prev_wrtr_sd_ct,
+ROUND(CAST(sls.cur_actv_shp_pat_ct AS double), 3) AS cur_actv_shp_pat_ct,
+ROUND(CAST(sls.cur_actv_all_pat_ct AS double), 3) AS cur_actv_all_pat_ct,
+ROUND(CAST(sls.cur_par_sp_unit AS double), 3) AS cur_par_sp_unit,
+ROUND(CAST(sls.cur_par_sd_unit AS double), 3) AS cur_par_sd_unit,
+ROUND(CAST(sls.cur_par_unit AS double), 3) AS cur_par_unit,
+ROUND(CAST(sls.cur_natl_sp_unit AS double), 3) AS cur_natl_sp_unit,
+ROUND(CAST(sls.cur_natl_sd_unit AS double), 3) AS cur_natl_sd_unit,
+ROUND(CAST(sls.cur_natl_unit AS double), 3) AS cur_natl_unit,
+ROUND(CAST(sls.cur_natl_actv_shp_pat_ct AS double), 3) AS cur_natl_actv_shp_pat_ct,
+ROUND(CAST(sls.cur_natl_actv_all_pat_ct AS double), 3) AS cur_natl_actv_all_pat_ct,
+ROUND(CAST(sls.cur_net_ref_ct AS double), 3) AS cur_net_ref_ct,
+ROUND(CAST(sls.prev_net_ref_ct AS double), 3) AS prev_net_ref_ct,
+ROUND(CAST(sls.cur_natl_net_ref_ct AS double), 3) AS cur_natl_net_ref_ct,
+ROUND(CAST(sls.cur_rch_pct AS double), 3) AS cur_rch_pct,
+ROUND(CAST(sls.cur_totl_cpd_ct AS double), 3) AS cur_totl_cpd_ct,
+ROUND(CAST(sls.cur_trgt_cpd_ct AS double), 3) AS cur_trgt_cpd_ct,
+ROUND(CAST(sls.cur_tdfa_pct AS double), 3) AS cur_tdfa_pct,
+CAST(sls.src_load_dt AS string) AS src_load_dt,
+cast({data_dt} as string) data_dt,
+cast({cycl_id} as string) cycl_id
+from
+temp_natl_seg_excld_mtrc_df sls
+""")
+spark.sql(f"""
+INSERT OVERWRITE TABLE {to_publish_schema_name}.{to_spark_table_name}
+select
+tb_id,  
+geo_id,   
+team_id,   
+az_mkt_id,  
+brd_fam_id,  
+cur_trx_ct,  
+prev_trx_ct,  
+cur_mkt_trx_ct,  
+prev_mkt_trx_ct,  
+cur_nrx_ct,  
+prev_nrx_ct,  
+cur_mkt_nrx_ct,  
+prev_mkt_nrx_ct,  
+cur_nbrx_ct,  
+prev_nbrx_ct,  
+cur_mkt_nbrx_ct,  
+prev_mkt_nbrx_ct,  
+cur_natl_trx_ct,  
+prev_natl_trx_ct,  
+cur_natl_mkt_trx_ct,  
+prev_natl_mkt_trx_ct,  
+cur_natl_nrx_ct,  
+prev_natl_nrx_ct,  
+cur_natl_mkt_nrx_ct,  
+prev_natl_mkt_nrx_ct,  
+cur_natl_nbrx_ct,  
+prev_natl_nbrx_ct,  
+cur_natl_mkt_nbrx_ct,  
+prev_natl_mkt_nbrx_ct,  
+cur_par_trx_ct,  
+cur_par_nrx_ct,  
+cur_par_nbrx_ct,    
+cur_uvrs_ct,  
+cur_tot_wrtr,  
+prev_tot_wrtr,  
+cur_trlst_ct,  
+prev_trlst_ct,  
+cur_rptr_ct,  
+prev_rptr_ct,  
+cur_adpt_ct,  
+prev_adptr_ct,    
+cur_dmnd_unit,  
+prev_dmnd_unit,  
+cur_mkt_dmnd_unit,  
+prev_mkt_dmnd_unit,  
+cur_ddd_unit,  
+prev_ddd_unit,  
+cur_mkt_ddd_unit,  
+prev_mkt_ddd_unit,  
+cur_par_ddd_unit,  
+cur_natl_ddd_unit,  
+cur_natl_mkt_ddd_unit,  
+cur_sp_unit,  
+prev_sp_unit,  
+cur_sd_unit,  
+prev_sd_unit,  
+cur_unit,  
+prev_unit,  
+cur_sd_vial,  
+prev_sd_vial,  
+cur_wrtr_sd_ct,  
+prev_wrtr_sd_ct,  
+cur_actv_shp_pat_ct,  
+cur_actv_all_pat_ct,  
+cur_par_sp_unit,  
+cur_par_sd_unit,  
+cur_par_unit,  
+cur_natl_sp_unit,  
+cur_natl_sd_unit,  
+cur_natl_unit,  
+cur_natl_actv_shp_pat_ct,  
+cur_natl_actv_all_pat_ct,
+cur_net_ref_ct,
+prev_net_ref_ct,
+cur_natl_net_ref_ct,
+cur_rch_pct,  
+cur_totl_cpd_ct,  
+cur_trgt_cpd_ct,  
+cur_tdfa_pct,  
+src_load_dt,
+data_dt,  
+cycl_id
+from 
+{to_datalake_schema_name}.{to_spark_table_name}
+where 
+cycl_id = '{cycl_id}'
+""")
+spark.sql("""ALTER TABLE {to_datalake_schema_name}.{to_table_name} recover partitions""".format(to_datalake_schema_name=to_datalake_schema_name, to_table_name=to_table_name))
+spark.sql("""REFRESH TABLE {to_publish_schema_name}.{to_table_name}""".format(to_publish_schema_name=to_publish_schema_name, to_table_name=to_table_name))
+spark.sql("""ALTER TABLE {to_datalake_schema_name}.{to_table_name} recover partitions""".format(to_datalake_schema_name=to_datalake_schema_name, to_table_name=to_spark_table_name))
+spark.sql("""REFRESH TABLE {to_publish_schema_name}.{to_table_name}""".format(to_publish_schema_name=to_publish_schema_name, to_table_name=to_spark_table_name))
